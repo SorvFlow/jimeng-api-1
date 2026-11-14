@@ -10,10 +10,17 @@ import { getCredit, receiveCredit, request, parseRegionFromToken, getAssistantId
 import logger from "@/lib/logger.ts";
 import { SmartPoller, PollingStatus } from "@/lib/smart-poller.ts";
 import { DEFAULT_ASSISTANT_ID_CN, DEFAULT_ASSISTANT_ID_US, DEFAULT_ASSISTANT_ID_HK, DEFAULT_ASSISTANT_ID_JP, DEFAULT_ASSISTANT_ID_SG, DEFAULT_VIDEO_MODEL, DRAFT_VERSION, DRAFT_VERSION_OMNI, OMNI_BENEFIT_TYPE, OMNI_BENEFIT_TYPE_FAST, VIDEO_MODEL_MAP, VIDEO_MODEL_MAP_US, VIDEO_MODEL_MAP_ASIA } from "@/api/consts/common.ts";
+import {
+  getSeedance25Capabilities,
+  SEEDANCE_25_FPS,
+  SEEDANCE_25_MAX_REFERENCE_DURATION,
+  SEEDANCE_25_T2V_DRAFT_VERSION,
+  SEEDANCE_25_T2V_MIN_VERSION,
+} from "@/api/consts/seedance25.ts";
 import { uploadImageBuffer, ImageUploadResult } from "@/lib/image-uploader.ts";
-import { uploadVideoBuffer, VideoUploadResult } from "@/lib/video-uploader.ts";
+import { uploadAudioBuffer, AudioUploadResult, uploadVideoBuffer, VideoUploadResult } from "@/lib/video-uploader.ts";
 import { extractVideoUrl, fetchHighQualityVideoUrl } from "@/lib/image-utils.ts";
-import { uploadVideoFromUrl } from "@/lib/video-uploader.ts";
+import { uploadAudioFromUrl, uploadVideoFromUrl } from "@/lib/video-uploader.ts";
 
 export const DEFAULT_MODEL = DEFAULT_VIDEO_MODEL;
 
@@ -30,7 +37,23 @@ export function getModel(model: string, regionInfo: RegionInfo) {
   return modelMap[model] || modelMap[DEFAULT_MODEL] || VIDEO_MODEL_MAP[DEFAULT_MODEL];
 }
 
-function getVideoBenefitType(model: string): string {
+export function getVideoBenefitType(
+  model: string,
+  resolution = "720p",
+  hasInputVideo = false
+): string {
+  if (model.includes("dreamina_seedance_45_pro")) {
+    // Captured standard types are keyed by output resolution and input-video presence.
+    // The separate long_video variants exist, but their cutoff is unverified; do not guess it.
+    return hasInputVideo
+      ? `seedance_25_${resolution}_output`
+      : `seedance_25_${resolution}_no_input_video_output`;
+  }
+  if (model.includes("dreamina_seedance_45_flash")) {
+    return hasInputVideo
+      ? `seedance_25_flash_${resolution}_output`
+      : `seedance_25_flash_${resolution}_no_input_video`;
+  }
   // veo3.1 模型 (需先于 veo3 检查)
   if (model.includes("veo3.1")) {
     return "generate_video_veo3.1";
@@ -73,7 +96,7 @@ async function uploadImageFromFile(file: any, refreshToken: string, regionInfo: 
 // 处理来自URL的图片
 async function uploadImageFromUrl(imageUrl: string, refreshToken: string, regionInfo: RegionInfo): Promise<ImageUploadResult> {
   try {
-    logger.info(`开始从URL下载并上传视频图片: ${imageUrl}`);
+    logger.info(`开始从URL下载并上传视频图片: ${util.safeURLLabel(imageUrl)}`);
     const imageResponse = await axios.get(imageUrl, {
       responseType: 'arraybuffer',
       proxy: false,
@@ -84,8 +107,8 @@ async function uploadImageFromUrl(imageUrl: string, refreshToken: string, region
     const imageBuffer = imageResponse.data;
     return await uploadImageBuffer(imageBuffer, refreshToken, regionInfo);
   } catch (error: any) {
-    logger.error(`从URL上传视频图片失败: ${error.message}`);
-    throw error;
+    logger.error(`从URL上传视频图片失败 (${util.safeURLLabel(imageUrl)}): ${error.code || error.response?.status || String(error.message).replaceAll(imageUrl, util.safeURLLabel(imageUrl))}`);
+    throw new Error(`从URL上传视频图片失败: ${error.response?.status || error.code || String(error.message).replaceAll(imageUrl, util.safeURLLabel(imageUrl))}`);
   }
 }
 
@@ -164,6 +187,7 @@ export async function generateVideo(
     files = {},
     httpRequest,
     functionMode = "first_last_frames",
+    seed,
   }: {
     ratio?: string;
     resolution?: string;
@@ -172,6 +196,7 @@ export async function generateVideo(
     files?: any;
     httpRequest?: any;
     functionMode?: string;
+    seed?: number;
   },
   refreshToken: string
 ) {
@@ -182,13 +207,18 @@ export async function generateVideo(
   logger.info(`视频生成区域检测: isInternational=${isInternational}`);
 
   const model = getModel(_model, regionInfo);
+  const seedance25Capabilities = getSeedance25Capabilities(_model);
+  const isSeedance25 = Boolean(seedance25Capabilities);
+  if (isSeedance25 && !isInternational) {
+    throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.5 模型仅支持 Dreamina 国际站账号");
+  }
   const isVeo3 = model.includes("veo3");
   const isSora2 = model.includes("sora2");
   const is35Pro = model.includes("3.5_pro");
   const is40Pro = model.includes("40_pro");
   const is40 = model.includes("40") && !model.includes("40_pro");
   // 只有 video-3.0 和 video-3.0-fast 支持 resolution 参数（3.0-pro 和 3.5-pro 不支持）
-  const supportsResolution = (model.includes("vgfm_3.0") || model.includes("vgfm_3.0_fast")) && !model.includes("_pro");
+  const supportsResolution = isSeedance25 || ((model.includes("vgfm_3.0") || model.includes("vgfm_3.0_fast")) && !model.includes("_pro"));
 
   // 将秒转换为毫秒
   // veo3 模型固定 8 秒
@@ -212,6 +242,12 @@ export async function generateVideo(
       durationMs = 4000;
       actualDuration = 4;
     }
+  } else if (isSeedance25) {
+    if (!Number.isInteger(duration) || duration < 4 || duration > 30) {
+      throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.5 模型支持 4~30 秒整数时长");
+    }
+    actualDuration = duration;
+    durationMs = actualDuration * 1000;
   } else if (is40Pro || is40) {
     // seedance 2.0 和 2.0-fast: 支持 4~15 秒，clamp 到有效范围，默认 5 秒
     actualDuration = Math.max(4, Math.min(15, duration));
@@ -248,23 +284,48 @@ export async function generateVideo(
   }
 
   const isOmniMode = functionMode === "omni_reference";
+  const seedance25RefFields = Object.keys(files || {}).concat(Object.keys(httpRequest?.body || {}))
+    .filter((field) => /^(image|video|audio)_file(?:_\d+)?$/.test(field))
+    .some((field) => files?.[field] || (typeof httpRequest?.body?.[field] === "string" && /^https?:\/\//i.test(httpRequest.body[field])));
+  const hasSeedance25References = Boolean(seedance25RefFields || filePaths.length > 0);
+  if (isSeedance25) {
+    const hasVideoOrAudioReferences = [...Object.keys(files || {}), ...Object.keys(httpRequest?.body || {})]
+      .some((field) => /^(video|audio)_file(?:_\d+)?$/.test(field)
+        && (files?.[field] || (typeof httpRequest?.body?.[field] === "string" && /^https?:\/\//i.test(httpRequest.body[field]))));
+    if (!isOmniMode && hasVideoOrAudioReferences) {
+      throw new APIException(EX.API_REQUEST_FAILED, "视频和音频参考需要设置 functionMode=omni_reference");
+    }
+    if (!isOmniMode) {
+      const imageCount = new Set([...Object.keys(files || {}), ...Object.keys(httpRequest?.body || {})]
+        .filter((field) => /^image_file(?:_\d+)?$/.test(field))
+        .filter((field) => files?.[field] || (typeof httpRequest?.body?.[field] === "string" && /^https?:\/\//i.test(httpRequest.body[field]))))
+        .size + filePaths.length;
+      if (imageCount > 2) {
+        throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.5 首尾帧模式最多支持2张参考图片");
+      }
+    }
+    if (!hasSeedance25References && !prompt.trim()) {
+      throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.5 文生视频需要非空 prompt");
+    }
+    if (prompt.length > 15000) throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.5 prompt 最多 15000 个字符");
+  }
 
-  // omni_reference 仅支持 seedance 2.0 (40_pro) 和 2.0-fast (40) 模型
-  if (isOmniMode && !is40Pro && !is40) {
+  // omni_reference supports the existing Seedance 2.x paths and Seedance 2.5.
+  if (isOmniMode && !is40Pro && !is40 && !isSeedance25) {
     throw new APIException(EX.API_REQUEST_FAILED,
       `omni_reference 模式仅支持 jimeng-video-seedance-2.0 和 jimeng-video-seedance-2.0-fast 模型`);
   }
 
   let requestData: any;
 
-  if (isOmniMode) {
+  if (isOmniMode && (!isSeedance25 || hasSeedance25References)) {
     // ========== omni_reference 分支 ==========
     logger.info(`进入 omni_reference 全能模式`);
 
     // 素材注册表: fieldName → { idx, type, uploadResult }
     interface MaterialEntry {
       idx: number;
-      type: "image" | "video";
+      type: "image" | "video" | "audio";
       fieldName: string;
       originalFilename: string;
       imageUri?: string;
@@ -272,16 +333,20 @@ export async function generateVideo(
       imageHeight?: number;
       imageFormat?: string;
       videoResult?: VideoUploadResult;
+      audioResult?: AudioUploadResult;
     }
     const materialRegistry: Map<string, MaterialEntry> = new Map();
     let materialIdx = 0;
+    const maxImages = seedance25Capabilities?.maxImages || 9;
+    const maxVideos = seedance25Capabilities?.maxVideos || 3;
+    const maxAudios = seedance25Capabilities?.maxAudios || 0;
 
     // canonical key 集合，防止 originalFilename 覆盖
     const canonicalKeys = new Set<string>();
-    canonicalKeys.add('image_file');
-    canonicalKeys.add('video_file');
-    for (let i = 1; i <= 9; i++) canonicalKeys.add(`image_file_${i}`);
-    for (let i = 1; i <= 3; i++) canonicalKeys.add(`video_file_${i}`);
+    for (const type of ["image", "video", "audio"]) canonicalKeys.add(`${type}_file`);
+    for (let i = 1; i <= maxImages; i++) canonicalKeys.add(`image_file_${i}`);
+    for (let i = 1; i <= maxVideos; i++) canonicalKeys.add(`video_file_${i}`);
+    for (let i = 1; i <= maxAudios; i++) canonicalKeys.add(`audio_file_${i}`);
 
     // 安全注册别名：originalFilename 不与 canonical key 冲突时才注册
     function registerAlias(filename: string, entry: MaterialEntry) {
@@ -290,47 +355,33 @@ export async function generateVideo(
       }
     }
 
-    // 收集所有需要处理的图片和视频字段
-    const imageFields: string[] = [];
-    const videoFields: string[] = [];
-
-    // 检测上传的文件
-    if (files) {
-      for (const fieldName of Object.keys(files)) {
-        if (fieldName === 'image_file' || fieldName.startsWith('image_file_')) imageFields.push(fieldName);
-        else if (fieldName === 'video_file' || fieldName.startsWith('video_file_')) videoFields.push(fieldName);
-      }
-    }
-
-    // 检测URL字段
-    for (let i = 1; i <= 9; i++) {
-      const fieldName = `image_file_${i}`;
-      if (typeof httpRequest?.body?.[fieldName] === 'string' && httpRequest.body[fieldName].startsWith('http')) {
-        if (!imageFields.includes(fieldName)) imageFields.push(fieldName);
-      }
-    }
-    for (let i = 1; i <= 3; i++) {
-      const fieldName = `video_file_${i}`;
-      if (typeof httpRequest?.body?.[fieldName] === 'string' && httpRequest.body[fieldName].startsWith('http')) {
-        if (!videoFields.includes(fieldName)) videoFields.push(fieldName);
-      }
-    }
-    // 检测不带数字后缀的裸名 URL 字段
-    if (typeof httpRequest?.body?.image_file === 'string' && httpRequest.body.image_file.startsWith('http')) {
-      if (!imageFields.includes('image_file')) imageFields.push('image_file');
-    }
-    if (typeof httpRequest?.body?.video_file === 'string' && httpRequest.body.video_file.startsWith('http')) {
-      if (!videoFields.includes('video_file')) videoFields.push('video_file');
-    }
+    const mediaFields = (type: "image" | "video" | "audio", limit: number) => {
+      if (!limit) return [];
+      const names = new Set([...Object.keys(files || {}), ...Object.keys(httpRequest?.body || {})]);
+      return [...names].filter((fieldName) => {
+        if (!new RegExp(`^${type}_file(?:_\\d+)?$`).test(fieldName)) return false;
+        const suffix = fieldName.match(/_(\d+)$/)?.[1];
+        if (suffix && Number(suffix) > limit) return false;
+        return Boolean(files?.[fieldName]) || (typeof httpRequest?.body?.[fieldName] === "string" && /^https?:\/\//i.test(httpRequest.body[fieldName]));
+      }).sort((a, b) => {
+        const aIndex = Number(a.match(/_(\d+)$/)?.[1] || 0);
+        const bIndex = Number(b.match(/_(\d+)$/)?.[1] || 0);
+        return aIndex - bIndex;
+      });
+    };
+    const imageFields = mediaFields("image", maxImages);
+    const videoFields = mediaFields("video", maxVideos);
+    const audioFields = mediaFields("audio", maxAudios);
 
     // 检查是否有素材
     const hasFilePaths = filePaths && filePaths.length > 0;
-    if (imageFields.length === 0 && videoFields.length === 0 && !hasFilePaths) {
+    if (imageFields.length === 0 && videoFields.length === 0 && audioFields.length === 0 && !hasFilePaths) {
       throw new APIException(EX.API_REQUEST_FAILED,
-        `omni_reference 模式需要至少上传一个素材文件 (image_file_*, video_file_*) 或提供素材URL`);
+        `omni_reference 模式需要至少上传一个图片、视频或音频素材，或提供 OSS URL`);
     }
 
     let totalVideoDuration = 0; // 累计视频时长
+    let totalAudioDuration = 0;
 
     // 串行上传图片素材
     for (const fieldName of imageFields) {
@@ -386,14 +437,14 @@ export async function generateVideo(
       let slotIndex = 1;
       for (const url of filePaths) {
         // 找到第一个未被占用的槽位
-        while (slotIndex <= 9 && materialRegistry.has(`image_file_${slotIndex}`)) {
+        while (slotIndex <= maxImages && materialRegistry.has(`image_file_${slotIndex}`)) {
           slotIndex++;
         }
-        if (slotIndex > 9) break; // 已达到最大数量
+        if (slotIndex > maxImages) break; // 已达到最大数量
 
         const fieldName = `image_file_${slotIndex}`;
         try {
-          logger.info(`[omni] 从URL上传 ${fieldName}: ${url}`);
+          logger.info(`[omni] 从URL上传 ${fieldName}`);
           const imgResult = await uploadImageFromUrl(url, refreshToken, regionInfo);
           await checkImageContent(imgResult.uri, refreshToken, regionInfo);
           const entry: MaterialEntry = {
@@ -427,7 +478,8 @@ export async function generateVideo(
         if (videoFile) {
           // 本地文件上传
           const buf = await fs.readFile(videoFile.filepath);
-          vResult = await uploadVideoBuffer(buf, refreshToken, regionInfo);
+          if (isSeedance25 && buf.byteLength > 200 * 1024 * 1024) throw new Error("参考视频不能超过 200 MiB");
+          vResult = await uploadVideoBuffer(buf, refreshToken, regionInfo, isSeedance25 ? SEEDANCE_25_MAX_REFERENCE_DURATION : 15);
           totalVideoDuration += vResult.videoMeta.duration;
           const entry: MaterialEntry = {
             idx: materialIdx++,
@@ -441,7 +493,7 @@ export async function generateVideo(
           logger.info(`[omni] ${fieldName} 上传成功: vid=${vResult.vid}, ${vResult.videoMeta.width}x${vResult.videoMeta.height}, ${vResult.videoMeta.duration}s`);
         } else if (videoUrlField && typeof videoUrlField === 'string' && videoUrlField.startsWith('http')) {
           // URL上传
-          vResult = await uploadVideoFromUrl(videoUrlField, refreshToken, regionInfo);
+          vResult = await uploadVideoFromUrl(videoUrlField, refreshToken, regionInfo, isSeedance25 ? SEEDANCE_25_MAX_REFERENCE_DURATION : 15);
           totalVideoDuration += vResult.videoMeta.duration;
           const entry: MaterialEntry = {
             idx: materialIdx++,
@@ -453,13 +505,51 @@ export async function generateVideo(
           materialRegistry.set(fieldName, entry);
           logger.info(`[omni] ${fieldName} URL上传成功: vid=${vResult.vid}, ${vResult.videoMeta.width}x${vResult.videoMeta.height}, ${vResult.videoMeta.duration}s`);
         }
+        if (isSeedance25 && (!vResult || !Number.isFinite(vResult.videoMeta.duration) || vResult.videoMeta.duration < 1.8 || vResult.videoMeta.duration > SEEDANCE_25_MAX_REFERENCE_DURATION)) {
+          throw new Error(`参考视频时长需为 1.8~${SEEDANCE_25_MAX_REFERENCE_DURATION} 秒`);
+        }
+      } catch (error: any) {
+        throw new APIException(EX.API_REQUEST_FAILED, `${fieldName} 处理失败: ${error.message}`);
+      }
+    }
+
+    for (const fieldName of audioFields) {
+      const audioFile = files?.[fieldName];
+      const audioUrlField = httpRequest?.body?.[fieldName];
+
+      try {
+        logger.info(`[omni] 上传 ${fieldName}`);
+        let audioResult: AudioUploadResult;
+        if (audioFile) {
+          const buf = await fs.readFile(audioFile.filepath);
+          if (buf.byteLength > 15 * 1024 * 1024) throw new Error("参考音频不能超过 15 MiB");
+          audioResult = await uploadAudioBuffer(buf, refreshToken, regionInfo);
+        } else if (typeof audioUrlField === "string" && /^https?:\/\//i.test(audioUrlField)) {
+          audioResult = await uploadAudioFromUrl(audioUrlField, refreshToken, regionInfo);
+        } else {
+          continue;
+        }
+        if (!Number.isFinite(audioResult.duration) || audioResult.duration < 1.8 || audioResult.duration > SEEDANCE_25_MAX_REFERENCE_DURATION) {
+          throw new Error(`参考音频时长需为 1.8~${SEEDANCE_25_MAX_REFERENCE_DURATION} 秒`);
+        }
+        totalAudioDuration += audioResult.duration;
+        const entry: MaterialEntry = {
+          idx: materialIdx++,
+          type: "audio",
+          fieldName,
+          originalFilename: audioFile?.originalFilename || fieldName,
+          audioResult,
+        };
+        materialRegistry.set(fieldName, entry);
+        if (audioFile?.originalFilename) registerAlias(audioFile.originalFilename, entry);
+        logger.info(`[omni] ${fieldName} 上传成功: vid=${audioResult.vid}, ${audioResult.duration}s, ${audioResult.format}`);
       } catch (error: any) {
         throw new APIException(EX.API_REQUEST_FAILED, `${fieldName} 处理失败: ${error.message}`);
       }
     }
 
     // 验证视频总时长
-    const MAX_TOTAL_VIDEO_DURATION = 15;
+    const MAX_TOTAL_VIDEO_DURATION = isSeedance25 ? SEEDANCE_25_MAX_REFERENCE_DURATION : 15;
     if (!Number.isFinite(totalVideoDuration)) {
       throw new APIException(EX.API_REQUEST_FAILED,
         `视频时长数据异常，请检查视频文件`);
@@ -467,6 +557,11 @@ export async function generateVideo(
     if (totalVideoDuration > MAX_TOTAL_VIDEO_DURATION) {
       throw new APIException(EX.API_REQUEST_FAILED,
         `视频总时长 ${totalVideoDuration.toFixed(2)}s 超过限制 (最大 ${MAX_TOTAL_VIDEO_DURATION}s)`);
+    }
+
+    if (isSeedance25 && totalAudioDuration > SEEDANCE_25_MAX_REFERENCE_DURATION) {
+      throw new APIException(EX.API_REQUEST_FAILED,
+        `音频总时长 ${totalAudioDuration.toFixed(2)}s 超过限制 (最大 ${SEEDANCE_25_MAX_REFERENCE_DURATION}s)`);
     }
 
     logger.info(`[omni] 视频总时长: ${totalVideoDuration.toFixed(2)}s`);
@@ -498,7 +593,7 @@ export async function generateVideo(
           },
         });
         materialTypes.push(1);
-      } else {
+      } else if (entry.type === "video") {
         const vm = entry.videoResult!;
         material_list.push({
           type: "",
@@ -517,6 +612,22 @@ export async function generateVideo(
           },
         });
         materialTypes.push(2);
+      } else {
+        const am = entry.audioResult!;
+        material_list.push({
+          type: "",
+          id: util.uuid(),
+          material_type: "audio",
+          audio_info: {
+            type: "audio",
+            id: util.uuid(),
+            source_from: "upload",
+            name: "",
+            vid: am.vid,
+            duration: Math.round(am.duration * 1000),
+          },
+        });
+        materialTypes.push(3);
       }
     }
 
@@ -532,29 +643,34 @@ export async function generateVideo(
     const sceneOption = {
       type: "video",
       scene: "BasicVideoGenerateButton",
+      ...(isSeedance25 ? { resolution } : {}),
       modelReqKey: model,
       videoDuration: actualDuration,
       materialTypes,
       reportParams: {
         enterSource: "generate",
         vipSource: "generate",
-        extraVipFunctionKey: model,
+        extraVipFunctionKey: isSeedance25 ? `${model}-${resolution}` : model,
         useVipFunctionDetailsReporterHoc: true,
       },
     };
 
     const metricsExtra = JSON.stringify({
       position: "page_bottom_box",
-      isDefaultSeed: 1,
+      isDefaultSeed: isSeedance25 && seed !== undefined ? 0 : 1,
       originSubmitId: submitId,
       isRegenerate: false,
       enterFrom: "click",
       functionMode: "omni_reference",
+      ...(isSeedance25 && seed !== undefined ? { seed } : {}),
       sceneOptions: JSON.stringify([sceneOption]),
     });
 
     // 根据模型选择 benefit_type
-    const omniBenefitType = is40 ? OMNI_BENEFIT_TYPE_FAST : OMNI_BENEFIT_TYPE;
+    const hasInputVideo = orderedEntries.some((entry) => entry.type === "video");
+    const omniBenefitType = isSeedance25
+      ? getVideoBenefitType(model, resolution, hasInputVideo)
+      : is40 ? OMNI_BENEFIT_TYPE_FAST : OMNI_BENEFIT_TYPE;
 
     requestData = {
       params: {
@@ -619,6 +735,7 @@ export async function generateVideo(
                     video_mode: 2,
                     fps: 24,
                     duration_ms: durationMs,
+                    ...(isSeedance25 ? { resolution } : {}),
                     unified_edit_input: {
                       type: "",
                       id: util.uuid(),
@@ -628,7 +745,7 @@ export async function generateVideo(
                     idip_meta_list: [],
                   }],
                   video_aspect_ratio: ratio,
-                  seed: Math.floor(Math.random() * 4294967296),
+                  seed: seed ?? Math.floor(Math.random() * 4294967296),
                   model_req_key: model,
                   priority: 0,
                 },
@@ -648,10 +765,26 @@ export async function generateVideo(
     let first_frame_image = undefined;
     let end_frame_image = undefined;
     let uploadIDs: string[] = [];
-
     // 优先处理本地上传的文件
     const uploadedFiles = _.values(files);
-    if (uploadedFiles && uploadedFiles.length > 0) {
+    if (isSeedance25) {
+      // 同一字段的文件优先于 URL；不同字段按编号排序，保证首尾帧顺序。
+      const imageFields = [...new Set([...Object.keys(files || {}), ...Object.keys(httpRequest?.body || {})])]
+        .filter(name => /^image_file(?:_\d+)?$/.test(name))
+        .sort((a, b) => Number(a.match(/_(\d+)$/)?.[1] || 0) - Number(b.match(/_(\d+)$/)?.[1] || 0));
+      const images = imageFields.map(name => files?.[name] || httpRequest.body[name]).concat(filePaths);
+      for (const [index, image] of images.entries()) {
+        try {
+          const result = typeof image === "string"
+            ? await uploadImageFromUrl(image, refreshToken, regionInfo)
+            : await uploadImageFromFile(image, refreshToken, regionInfo);
+          await checkImageContent(result.uri, refreshToken, regionInfo);
+          uploadIDs.push(result.uri);
+        } catch (error: any) {
+          throw new APIException(EX.API_REQUEST_FAILED, `第 ${index + 1} 个参考图片处理失败: ${error.message}`);
+        }
+      }
+    } else if (uploadedFiles && uploadedFiles.length > 0) {
       logger.info(`检测到 ${uploadedFiles.length} 个本地上传文件，优先处理`);
       for (let i = 0; i < uploadedFiles.length; i++) {
         const file = uploadedFiles[i];
@@ -682,7 +815,7 @@ export async function generateVideo(
           continue;
         }
         try {
-          logger.info(`开始上传第 ${i + 1} 个URL图片: ${filePath}`);
+          logger.info(`开始上传第 ${i + 1} 个URL图片`);
           const imgResult = await uploadImageFromUrl(filePath, refreshToken, regionInfo);
           if (imgResult) {
             await checkImageContent(imgResult.uri, refreshToken, regionInfo);
@@ -722,7 +855,7 @@ export async function generateVideo(
 
     const componentId = util.uuid();
     const originSubmitId = util.uuid();
-    const flFunctionMode = "first_last_frames";
+    const flFunctionMode = isSeedance25 && uploadIDs.length === 0 ? "t2v" : "first_last_frames";
 
     const sceneOption = {
       type: "video",
@@ -741,7 +874,7 @@ export async function generateVideo(
 
     const metricsExtra = JSON.stringify({
       promptSource: "custom",
-      isDefaultSeed: 1,
+      isDefaultSeed: isSeedance25 && seed !== undefined ? 0 : 1,
       originSubmitId,
       isRegenerate: false,
       enterFrom: "use_bgimage_prompt",
@@ -751,7 +884,7 @@ export async function generateVideo(
     });
 
     const hasImageInput = uploadIDs.length > 0;
-    if (hasImageInput && ratio !== "1:1") {
+    if (!isSeedance25 && hasImageInput && ratio !== "1:1") {
       logger.warn(`图生视频模式下，ratio参数将被忽略（由输入图片的实际比例决定），但resolution参数仍然有效`);
     }
 
@@ -761,19 +894,19 @@ export async function generateVideo(
       params: {
         aigc_features: "app_lip_sync",
         web_version: "7.5.0",
-        da_version: DRAFT_VERSION,
+        da_version: isSeedance25 ? SEEDANCE_25_T2V_DRAFT_VERSION : DRAFT_VERSION,
       },
       data: {
         extend: {
           root_model: model,
           m_video_commerce_info: {
-            benefit_type: getVideoBenefitType(model),
+            benefit_type: getVideoBenefitType(model, resolution, false),
             resource_id: "generate_video",
             resource_id_type: "str",
             resource_sub_type: "aigc",
           },
           m_video_commerce_info_list: [{
-            benefit_type: getVideoBenefitType(model),
+            benefit_type: getVideoBenefitType(model, resolution, false),
             resource_id: "generate_video",
             resource_id_type: "str",
             resource_sub_type: "aigc",
@@ -784,10 +917,10 @@ export async function generateVideo(
         draft_content: JSON.stringify({
           type: "draft",
           id: util.uuid(),
-          min_version: "3.0.5",
-          min_features: [],
+          min_version: isSeedance25 ? SEEDANCE_25_T2V_MIN_VERSION : "3.0.5",
+          min_features: isSeedance25 ? ["AIGC_Video_Seedance25ResultAction"] : [],
           is_from_tsn: true,
-          version: DRAFT_VERSION,
+          version: isSeedance25 ? SEEDANCE_25_T2V_DRAFT_VERSION : DRAFT_VERSION,
           main_component_id: componentId,
           component_list: [{
             type: "video_base_component",
@@ -815,10 +948,10 @@ export async function generateVideo(
                   video_gen_inputs: [{
                     type: "",
                     id: util.uuid(),
-                    min_version: "3.0.5",
+                    min_version: isSeedance25 ? SEEDANCE_25_T2V_MIN_VERSION : "3.0.5",
                     prompt,
                     video_mode: 2,
-                    fps: 24,
+                    fps: isSeedance25 ? SEEDANCE_25_FPS : 24,
                     duration_ms: durationMs,
                     ...(supportsResolution ? { resolution } : {}),
                     first_frame_image,
@@ -826,7 +959,7 @@ export async function generateVideo(
                     idip_meta_list: [],
                   }],
                   video_aspect_ratio: ratio,
-                  seed: Math.floor(Math.random() * 4294967296),
+                  seed: seed ?? Math.floor(Math.random() * 4294967296),
                   model_req_key: model,
                   priority: 0,
                 },

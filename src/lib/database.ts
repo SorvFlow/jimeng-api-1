@@ -665,9 +665,9 @@ export function deleteApiKey(keyId: number): void {
   db.prepare('DELETE FROM api_keys WHERE id = ?').run(keyId);
 }
 
-export function getRandomAccountToken(): string | null {
-  const accounts = db.prepare('SELECT token FROM jimeng_accounts WHERE status != ? ORDER BY RANDOM() LIMIT 1').all('invalid') as { token: string }[];
-  return accounts.length > 0 ? accounts[0].token : null;
+export function getRandomAccountToken(isEligible?: (token: string) => boolean): string | null {
+  const accounts = db.prepare(`SELECT token FROM jimeng_accounts WHERE status != ? ORDER BY RANDOM()${isEligible ? '' : ' LIMIT 1'}`).all('invalid') as { token: string }[];
+  return accounts.find(account => !isEligible || isEligible(account.token))?.token || null;
 }
 
 /**

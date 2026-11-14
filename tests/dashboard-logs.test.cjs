@@ -173,6 +173,10 @@ test('dashboard renders details safely and labels estimates separately from actu
   const rows = Object.fromEntries(logDetailRows({ model: 'jimeng-video-3.5-pro', estimatedCredits: 40, actualCredits: null }));
   assert.match(rows['规则预估积分'], /40.*非实扣/);
   assert.match(rows['实际扣费'], /未知/);
+  const partialRows = Object.fromEntries(logDetailRows({ result: 'partial', inputAudioCount: 2, failedOutputCount: 1 }));
+  assert.match(partialRows['处理结果'], /部分完成/);
+  assert.equal(partialRows['输入音频数'], '2');
+  assert.equal(partialRows['失败输出数'], '1');
   assert.ok(html.includes('<details class="log-details"'), 'missing expandable log details');
 
   const container = { innerHTML: '', querySelectorAll: () => [] };

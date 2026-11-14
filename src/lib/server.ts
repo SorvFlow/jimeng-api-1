@@ -57,7 +57,8 @@ function getRequestLogDetails(ctx: any, route: string, code: number | null) {
     if (knownRatios.has(ratio)) details.requestedRatio = ratio;
     if (category === 'video') {
         const duration = body.duration === undefined ? 5 : Number(body.duration);
-        if (Number.isInteger(duration) && duration >= 1 && duration <= 15) details.requestedDurationSeconds = duration;
+        const maxDuration = typeof model === 'string' && model.includes('seedance-2.5') ? 30 : 15;
+        if (Number.isInteger(duration) && duration >= 1 && duration <= maxDuration) details.requestedDurationSeconds = duration;
     }
     if (isVideo && ['first_last_frames', 'omni_reference'].includes(body.functionMode || 'first_last_frames')) {
         details.functionMode = body.functionMode || 'first_last_frames';
@@ -66,6 +67,7 @@ function getRequestLogDetails(ctx: any, route: string, code: number | null) {
             : Array.isArray(body.file_paths) ? body.file_paths : [];
         details.inputImageCount = [...fieldNames].filter(name => /^image_file(_\d+)?$/.test(name)).length + paths.length;
         details.inputVideoCount = [...fieldNames].filter(name => /^video_file(_\d+)?$/.test(name)).length;
+        details.inputAudioCount = [...fieldNames].filter(name => /^audio_file(_\d+)?$/.test(name)).length;
     }
     if (isChat) {
         if (Array.isArray(body.messages)) details.messageCount = body.messages.length;
@@ -84,6 +86,10 @@ function getRequestLogDetails(ctx: any, route: string, code: number | null) {
     const reported = ctx.state.requestLogDetails || {};
     if (Number.isInteger(reported.accountId) && reported.accountId > 0) details.accountId = reported.accountId;
     if (Array.isArray(ctx.body?.data)) details.outputCount = ctx.body.data.length;
+    if (isVideo && Array.isArray(ctx.body?.errors) && ctx.body.errors.length > 0) {
+        details.result = 'partial';
+        details.failedOutputCount = ctx.body.errors.length;
+    }
     // 规则预估并非上游实际扣费；校验失败的请求同样只表示“如果执行”的预计消耗。
     if (Number.isFinite(reported.estimatedCredits)) {
         details.estimatedCredits = reported.estimatedCredits;
@@ -221,12 +227,12 @@ class Server {
         });
 
         // 载荷解析器支持（只处理未被自定义解析器处理的请求）
-        this.app.use(async (ctx: any, next: Function) => {
+        this.app.use(async (ctx: any, next: Koa.Next) => {
             if (!ctx._jsonProcessed) {
                 await koaBody(Object.assign(_.clone(config.system.requestBody), {
                     multipart: true, // 开启multipart文件上传
                     formidable: {
-                        maxFileSize: 100 * 1024 * 1024, // 限制最大100MB
+                        maxFileSize: (ctx.path === '/v1/videos/generations' ? 200 : 100) * 1024 * 1024,
                     },
                     enableTypes: ['json', 'form', 'text', 'xml'] // 确保form类型被启用
                 }))(ctx, next);

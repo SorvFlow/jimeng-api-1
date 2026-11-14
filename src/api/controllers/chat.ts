@@ -135,8 +135,6 @@ export async function createCompletion(
           _model,
           promptText || lastMessage.content,
           {
-            width,
-            height,
             resolution: "720p",
             filePaths: imageUrls,
           },
@@ -310,7 +308,7 @@ export async function createCompletionStream(
       generateVideo(
         _model,
         promptText || lastMessage.content,
-        { width, height, resolution: "720p", filePaths: imageUrls },
+        { resolution: "720p", filePaths: imageUrls },
         refreshToken
       )
         .then((videoUrl) => {

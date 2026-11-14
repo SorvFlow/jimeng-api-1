@@ -62,6 +62,15 @@ const util = {
     return extname.substring(1).toLowerCase();
   },
 
+  safeURLLabel(value: string) {
+    try {
+      const url = new URL(value);
+      return `${url.protocol}//${url.host}${url.pathname}`;
+    } catch {
+      return "[invalid URL]";
+    }
+  },
+
   createCronJob(cronPatterns: any, callback?: Function) {
     if (!_.isFunction(callback))
       throw new Error("callback must be an Function");
@@ -308,7 +317,7 @@ const util = {
    * @param buffer ArrayBuffer 数据
    * @returns CRC32 十六进制字符串
    */
-  calculateCRC32(buffer: ArrayBuffer): string {
+  calculateCRC32(buffer: ArrayBuffer | Buffer): string {
     const crcTable = [];
     for (let i = 0; i < 256; i++) {
       let crc = i;

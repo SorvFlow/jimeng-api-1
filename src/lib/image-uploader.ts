@@ -269,7 +269,7 @@ export async function uploadImageFromUrl(
   regionInfo: RegionInfo
 ): Promise<ImageUploadResult> {
   try {
-    logger.info(`开始从URL下载并上传图片: ${imageUrl}`);
+    logger.info(`开始从URL下载并上传图片: ${util.safeURLLabel(imageUrl)}`);
 
     const imageResponse = await axios.get(imageUrl, {
       responseType: 'arraybuffer',
@@ -281,7 +281,7 @@ export async function uploadImageFromUrl(
     const imageBuffer = imageResponse.data;
     return await uploadImageBuffer(imageBuffer, refreshToken, regionInfo);
   } catch (error: any) {
-    logger.error(`从URL上传图片失败: ${error.message}`);
-    throw error;
+    logger.error(`从URL上传图片失败 (${util.safeURLLabel(imageUrl)}): ${error.code || error.response?.status || String(error.message).replaceAll(imageUrl, util.safeURLLabel(imageUrl))}`);
+    throw new Error(`从URL上传图片失败: ${error.response?.status || error.code || String(error.message).replaceAll(imageUrl, util.safeURLLabel(imageUrl))}`);
   }
 }

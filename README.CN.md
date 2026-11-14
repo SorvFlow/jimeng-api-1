@@ -437,39 +437,44 @@ A: 可以。现在支持直接上传本地文件。请参考上方的“本地�
 1. **文生视频（Text-to-Video）**：纯文本提示词，不使用任何图片
 2. **图生视频（Image-to-Video）**：使用单张图片作为首帧
 3. **首尾帧视频（First-Last Frame）**：使用两张图片分别作为首帧和尾帧
-4. **全能模式（Omni Reference）**（新）：混合图片+视频作为参考素材，在 prompt 中通过 `@字段名` 引用素材并描述其作用。仅 `jimeng-video-seedance-2.0` 模型支持。
+4. **全能参考模式（Omni Reference）**：Seedance 2.0 支持图片和视频参考；Seedance 2.5 / 2.5 Flash 支持图片、视频和音频混合参考，在 prompt 中通过 `@字段名` 引用素材。
 
 > **模式检测**：系统根据图片的存在情况自动判断生成模式：
 > - **无图片** → 文生视频模式
 > - **1张图片** → 图生视频模式（仅提供 first_frame_image）
 > - **2张图片** → 首尾帧视频模式（first_frame_image 和 end_frame_image 均提供）
-> - **`functionMode=omni_reference`** → 全能模式（需显式传入参数）
+> - **`functionMode=omni_reference`** → 全能参考模式（需显式传入参数；Seedance 2.5 系列在没有参考素材时可用于文生视频）
 
 **请求参数**:
 - `model` (string): 使用的视频模型名称。
-- `prompt` (string): 视频内容的文本描述。
-- `ratio` (string, 可选): 视频比例，默认为 `"1:1"`。支持的比例：`1:1`, `4:3`, `3:4`, `16:9`, `9:16`, `21:9`。**注意**：在图生视频模式下（有图片输入时），此参数将被忽略，视频比例由输入图片的实际比例决定。
-- `resolution` (string, 可选): 视频分辨率，默认为 `"720p"`。支持的分辨率：`720p`, `1080p`。**注意**：仅 `jimeng-video-3.0` 和 `jimeng-video-3.0-fast` 支持此参数，其他模型会忽略。
+- `prompt` (string): 视频内容的文本描述。Seedance 2.5/2.5 Flash 纯文生必填且非空；首尾帧/混合参考允许省略或传空字符串，最多 15,000 字符。
+- `ratio` (string, 可选): 视频比例，默认为 `"1:1"`。支持的比例：`1:1`, `4:3`, `3:4`, `16:9`, `9:16`, `21:9`。Seedance 2.5 会将此参数传给上游；有图片输入时最终裁切/画幅行为尚未通过成功生成验证。
+- `resolution` (string, 可选): 视频分辨率，默认为 `"720p"`。Seedance 2.5 Pro 支持 `480p`, `720p`, `1080p`, `4k`；Seedance 2.5 Flash 支持 `480p`, `720p`；其他模型支持情况见下方模型说明。
 - `duration` (number, 可选): 视频时长（秒）。不同模型支持的值：
   - `jimeng-video-veo3` / `jimeng-video-veo3.1`: `8`（固定）
   - `jimeng-video-sora2`: `4`（默认）、`8`、`12`
   - `jimeng-video-seedance-2.0`: `4`~`15`（支持任意整数秒，默认`5`）
+  - `jimeng-video-seedance-2.5` / `jimeng-video-seedance-2.5-flash`: `4`~`30`（任意整数秒，默认`5`）
   - `jimeng-video-3.5-pro`: `5`（默认）、`10`、`12`
   - 其他模型: `5`（默认）、`10`
-- `file_paths` (array, 可选): 一个包含图片URL的数组，用于指定视频的**首帧**（数组第1个元素）和**尾帧**（数组第2个元素）。
+- `file_paths` (array, 可选): 最多两个图片 URL，依次作为视频的**首帧**和**尾帧**；仅用于图片，不是视频或音频的通用输入字段。
 - `[file]` (file, 可选): 通过 `multipart/form-data` 方式上传的本地图片文件（最多2个），用于指定视频的**首帧**和**尾帧**。字段名可以任意，例如 `image1`。
 - `functionMode` (string, 可选): 生成模式。默认为 `"first_last_frames"`。支持的值：
   - `"first_last_frames"`（默认）：标准模式，根据图片数量自动判断文生视频/图生视频/首尾帧模式。
-  - `"omni_reference"`：全能模式。需要 `jimeng-video-seedance-2.0` 模型。通过指定字段名上传文件：`image_file_1` ~ `image_file_9`（图片）、`video_file_1` ~ `video_file_3`（视频），支持本地文件和网络URL。在 prompt 中使用 `@字段名` 引用素材。
+  - `"omni_reference"`：全能参考模式。Seedance 2.0 支持图片和视频；Seedance 2.5 Pro/Flash 支持图片、视频和音频混合参考。Seedance 2.5 使用 `image_file_N`、`video_file_N`、`audio_file_N` 字段，字段值可为 HTTP(S) OSS URL，并在 prompt 中通过 `@字段名` 引用。
 - `response_format` (string, 可选): 响应格式，支持 `url` (默认) 或 `b64_json`。
+- `seed` (uint32, 可选): Seedance 2.5 Pro/Flash 的随机种子，范围 `0`~`4294967295`。不传时由服务端生成；其他模型不保证支持。
+- `n` (integer, 可选): Seedance 2.5 Pro/Flash 批量输出数，默认 `1`，范围 `1`~`4`。服务端串行执行独立生成；后续失败时响应保留已生成的 `data` 并附 `errors`（从 0 开始的 `index`），随后停止。此参数不适用于其他模型。
+
+> Seedance 2.5 不接受直接传入 `fps`、`count`、`is_long_video` 或 `meta_list`；帧率固定为 24 fps，批量数请使用 `n`，素材引用请使用对应素材字段和 `@字段名`。完整参数及与抓包差异见[中文模型说明](docs/seedance-2.5-models.md)。
 
 > **图片输入说明**:
 > - 您可以通过 `file_paths` (URL数组) 或直接上传文件两种方式提供输入图片。
 > - 如果两种方式同时提供，系统将**优先使用本地上传的文件**。
 > - 最多支持2张图片，第1张作为视频首帧，第2张作为视频尾帧。
-> - **重要**：一旦提供图片输入（图生视频或首尾帧视频），`ratio` 参数将被忽略，视频比例将由输入图片的实际比例决定。`resolution` 参数仍然有效。
+> - **重要**：有图片输入时，最终裁切和画幅还会受图片尺寸影响；Seedance 2.5 会将 `ratio` 参数传给上游，但该组合的最终效果尚未通过成功生成验证。`resolution` 参数仍会传入模型请求。
 
-> **全能模式 (Omni Reference)**（新）:
+> **Seedance 2.0 全能参考模式**:
 > - 需要 `functionMode=omni_reference` 且 `model=jimeng-video-seedance-2.0`。
 > - **素材数量限制**：
 >   - 最多 **9 张图片**（`image_file_1` ~ `image_file_9`）
@@ -489,9 +494,69 @@ A: 可以。现在支持直接上传本地文件。请参考上方的“本地�
 > - **注意**：使用 curl `-F` 参数时，prompt 值中的 `@` 符号会被解释为文件引用。请使用 `--form-string` 代替 `-F` 来发送 prompt 字段。
 > - Prompt 示例：`"@image_file_1作为首帧，@image_file_2作为尾帧，运动动作模仿@video_file_1"`
 
+> **Seedance 2.5 / 2.5 Flash**：参数、模型差异、素材限制、OSS URL 输入示例和验证状态见[中文模型说明](docs/seedance-2.5-models.md)。该接口会由服务端读取 OSS URL，再上传到 Dreamina；OSS URL 本身不能替代上游素材标识。URL 必须能从运行 API 的服务器访问，预签名 URL 的 query 参数属于凭证，分享前请脱敏。
+
+**Seedance 2.5 文生视频示例**:
+
+```bash
+curl -X POST http://localhost:5100/v1/videos/generations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jimeng-video-seedance-2.5",
+    "prompt": "雨夜街道，霓虹倒映在路面，电影运镜",
+    "ratio": "16:9",
+    "resolution": "1080p",
+    "duration": 10
+  }'
+```
+
+**Seedance 2.5 首尾帧 OSS URL 示例**:
+
+```bash
+curl -X POST http://localhost:5100/v1/videos/generations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jimeng-video-seedance-2.5",
+    "prompt": "从第一帧开始，镜头平滑推进到最后一帧",
+    "functionMode": "first_last_frames",
+    "file_paths": [
+      "https://oss.example.com/first-frame.jpg?temporary-signature",
+      "https://oss.example.com/last-frame.jpg?temporary-signature"
+    ],
+    "ratio": "16:9",
+    "resolution": "720p",
+    "duration": 8,
+    "seed": 4150022505
+  }'
+```
+
+**Seedance 2.5 混合参考 OSS URL 示例**:
+
+```bash
+curl -X POST http://localhost:5100/v1/videos/generations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jimeng-video-seedance-2.5",
+    "prompt": "以 @image_file_1 为角色外观参考，动作参考 @video_file_1，节奏参考 @audio_file_1",
+    "functionMode": "omni_reference",
+    "ratio": "16:9",
+    "resolution": "720p",
+    "duration": 8,
+    "seed": 4150022505,
+    "image_file_1": "https://oss.example.com/character.jpg?temporary-signature",
+    "video_file_1": "https://oss.example.com/motion.mp4?temporary-signature",
+    "audio_file_1": "https://oss.example.com/music.mp3?temporary-signature"
+  }'
+```
+
 **支持的视频模型**:
 - `jimeng-video-seedance-2.0` - Seedance 2.0，仅国内站支持，支持4~15秒时长，支持全能模式 (Omni Reference) **（最新）**
 - `jimeng-video-seedance-2.0-fast` - Seedance 2.0 Fast，仅国内站支持，支持4~15秒时长，支持全能模式 (Omni Reference)，速度更快
+- `jimeng-video-seedance-2.5` - Seedance 2.5 Pro，Dreamina 国际站模型映射；详细参数和实际验证边界见[中文模型说明](docs/seedance-2.5-models.md)
+- `jimeng-video-seedance-2.5-flash` - Seedance 2.5 Flash，Dreamina 国际站模型映射；详细参数和实际验证边界见[中文模型说明](docs/seedance-2.5-models.md)
 - `jimeng-video-3.5-pro` - 专业版v3.5，国内/国际站均支持 **（默认）**
 - `jimeng-video-veo3` - Veo3模型，仅亚洲国际站 (HK/JP/SG) 支持，固定8秒时长
 - `jimeng-video-veo3.1` - Veo3.1模型，仅亚洲国际站 (HK/JP/SG) 支持，固定8秒时长

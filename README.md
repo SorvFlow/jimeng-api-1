@@ -465,6 +465,8 @@ Generate a video from a text prompt (Text-to-Video) or from start/end frame imag
 > - **Note**: When using curl `-F`, the `@` symbol in `prompt` values is interpreted as a file reference. Use `--form-string` for the prompt field instead.
 > - Example prompt: `"@image_file_1 as first frame, @image_file_2 as last frame, mimic motion from @video_file_1"`
 
+**Seedance 2.5 Pro/Flash 中文接入说明**：模型参数、OSS URL 首尾帧与混合参考示例、模型差异和未实测事项见[中文模型说明](docs/seedance-2.5-models.md)。
+
 **Supported Video Models**:
 - `jimeng-video-seedance-2.0` - Seedance 2.0, China site only, supports 4~15s duration, supports Omni Reference mode **(Latest)**
 - `jimeng-video-seedance-2.0-fast` - Seedance 2.0 Fast, China site only, supports 4~15s duration, supports Omni Reference mode, faster generation speed

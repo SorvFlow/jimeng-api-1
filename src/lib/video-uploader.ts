@@ -7,8 +7,8 @@ import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
 
 /**
- * 视频上传模块
- * 通过 VOD (vod.bytedanceapi.com) 上传视频文件，获取 Vid
+ * 视频与音频上传模块
+ * 复用 VOD (vod.bytedanceapi.com) 的签名、上传、提交流程获取 Vid
  */
 
 export interface VideoUploadResult {
@@ -26,6 +26,14 @@ export interface VideoUploadResult {
   };
 }
 
+export interface AudioUploadResult {
+  vid: string;
+  uri: string;
+  duration: number;
+  size: number;
+  format: string;
+}
+
 /**
  * 上传视频Buffer到VOD
  * @param videoBuffer 视频二进制数据
@@ -33,14 +41,19 @@ export interface VideoUploadResult {
  * @param regionInfo 区域信息
  * @returns 上传结果，包含 vid 和视频元信息
  */
-export async function uploadVideoBuffer(
+async function uploadVODBuffer(
   videoBuffer: ArrayBuffer | Buffer,
   refreshToken: string,
-  regionInfo: RegionInfo
-): Promise<VideoUploadResult> {
+  regionInfo: RegionInfo,
+  fileType: "video" | "audio",
+  maxVideoDuration = 15
+): Promise<VideoUploadResult | AudioUploadResult> {
   try {
     const fileSize = videoBuffer.byteLength;
-    logger.info(`开始上传视频Buffer... (size=${fileSize}, isInternational=${regionInfo.isInternational})`);
+    if (fileType === "audio" && (fileSize === 0 || fileSize > 15 * 1024 * 1024)) {
+      throw new Error("参考音频不能为空，且不能超过 15 MiB");
+    }
+    logger.info(`开始上传${fileType}Buffer... (size=${fileSize}, isInternational=${regionInfo.isInternational})`);
 
     // 第一步：获取上传令牌
     const tokenResult = await request("post", "/mweb/v1/get_upload_token", refreshToken, {
@@ -64,7 +77,7 @@ export async function uploadVideoBuffer(
     const randomStr = Math.random().toString(36).substring(2, 12);
 
     const vodHost = "https://vod.bytedanceapi.com";
-    const applyUrl = `${vodHost}/?Action=ApplyUploadInner&Version=2020-11-19&SpaceName=${spaceName}&FileType=video&IsInner=1&FileSize=${fileSize}&s=${randomStr}`;
+    const applyUrl = `${vodHost}/?Action=ApplyUploadInner&Version=2020-11-19&SpaceName=${spaceName}&FileType=${fileType}&IsInner=1&FileSize=${fileSize}&s=${randomStr}`;
 
     const awsRegion = RegionUtils.getAWSRegion(regionInfo);
     const origin = RegionUtils.getOrigin(regionInfo);
@@ -258,16 +271,34 @@ export async function uploadVideoBuffer(
     }
 
     const result = commitResult.Result.Results[0];
-    const videoMeta = result.VideoMeta;
-
     if (!result.Vid) {
       throw new Error(`提交视频上传响应缺少 Vid: ${JSON.stringify(result)}`);
     }
 
-    // 校验视频时长，即梦限制不超过15秒
-    const MAX_VIDEO_DURATION = 15;
-    if (videoMeta?.Duration && videoMeta.Duration > MAX_VIDEO_DURATION) {
-      throw new Error(`视频时长 ${videoMeta.Duration.toFixed(2)}s 超过限制 (最大 ${MAX_VIDEO_DURATION}s)`);
+    if (fileType === "audio") {
+      const audioMeta = result.AudioMeta;
+      const seconds = Number(audioMeta?.Duration);
+      const millis = Number(audioMeta?.DurationMs);
+      const duration = Number.isFinite(seconds) && seconds > 0
+        ? seconds
+        : Number.isFinite(millis) && millis > 0 ? millis / 1000 : 0;
+      if (duration <= 0) throw new Error("提交音频上传响应缺少有效 AudioMeta.Duration");
+      logger.info(`音频上传完成: vid=${result.Vid}, ${duration}s, ${audioMeta?.Format || ""}`);
+      return {
+        vid: result.Vid,
+        uri: audioMeta?.Uri || "",
+        duration,
+        size: audioMeta?.Size || fileSize,
+        format: audioMeta?.Format || "",
+      };
+    }
+
+    const videoMeta = result.VideoMeta;
+    const duration = Number(videoMeta?.Duration || 0);
+    if (!Number.isFinite(duration) || duration < 0) throw new Error("提交视频上传响应中的时长无效");
+
+    if (duration > maxVideoDuration) {
+      throw new Error(`视频时长 ${duration.toFixed(2)}s 超过限制 (最大 ${maxVideoDuration}s)`);
     }
 
     logger.info(`视频上传完成: vid=${result.Vid}, ${videoMeta?.Width}x${videoMeta?.Height}, ${videoMeta?.Duration}s, ${videoMeta?.Format}/${videoMeta?.Codec}`);
@@ -278,7 +309,7 @@ export async function uploadVideoBuffer(
       videoMeta: {
         width: videoMeta?.Width || 0,
         height: videoMeta?.Height || 0,
-        duration: videoMeta?.Duration || 0,
+        duration,
         bitrate: videoMeta?.Bitrate || 0,
         format: videoMeta?.Format || '',
         codec: videoMeta?.Codec || '',
@@ -287,9 +318,26 @@ export async function uploadVideoBuffer(
       },
     };
   } catch (error: any) {
-    logger.error(`视频Buffer上传失败: ${error.message}`);
+    logger.error(`${fileType}Buffer上传失败: ${error.message}`);
     throw error;
   }
+}
+
+export async function uploadVideoBuffer(
+  videoBuffer: ArrayBuffer | Buffer,
+  refreshToken: string,
+  regionInfo: RegionInfo,
+  maxDuration = 15
+): Promise<VideoUploadResult> {
+  return await uploadVODBuffer(videoBuffer, refreshToken, regionInfo, "video", maxDuration) as VideoUploadResult;
+}
+
+export async function uploadAudioBuffer(
+  audioBuffer: ArrayBuffer | Buffer,
+  refreshToken: string,
+  regionInfo: RegionInfo
+): Promise<AudioUploadResult> {
+  return await uploadVODBuffer(audioBuffer, refreshToken, regionInfo, "audio") as AudioUploadResult;
 }
 
 /**
@@ -302,15 +350,16 @@ export async function uploadVideoBuffer(
 export async function uploadVideoFromUrl(
   videoUrl: string,
   refreshToken: string,
-  regionInfo: RegionInfo
+  regionInfo: RegionInfo,
+  maxDuration = 15
 ): Promise<VideoUploadResult> {
   try {
-    logger.info(`开始从URL下载并上传视频: ${videoUrl}`);
+    logger.info(`开始从URL下载并上传视频: ${util.safeURLLabel(videoUrl)}`);
 
     const videoResponse = await axios.get(videoUrl, {
       responseType: 'arraybuffer',
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
+      maxContentLength: 200 * 1024 * 1024,
+      maxBodyLength: 200 * 1024 * 1024,
     });
     if (videoResponse.status < 200 || videoResponse.status >= 300) {
       throw new Error(`下载视频失败: ${videoResponse.status}`);
@@ -318,9 +367,31 @@ export async function uploadVideoFromUrl(
 
     const videoBuffer = videoResponse.data;
     logger.info(`视频下载完成: ${videoBuffer.byteLength} 字节`);
-    return await uploadVideoBuffer(videoBuffer, refreshToken, regionInfo);
+    return await uploadVideoBuffer(videoBuffer, refreshToken, regionInfo, maxDuration);
   } catch (error: any) {
-    logger.error(`从URL上传视频失败: ${error.message}`);
-    throw error;
+    logger.error(`从URL上传视频失败 (${util.safeURLLabel(videoUrl)}): ${error.code || error.response?.status || String(error.message).replaceAll(videoUrl, util.safeURLLabel(videoUrl))}`);
+    throw new Error(`从URL上传视频失败: ${error.response?.status || error.code || String(error.message).replaceAll(videoUrl, util.safeURLLabel(videoUrl))}`);
+  }
+}
+
+export async function uploadAudioFromUrl(
+  audioUrl: string,
+  refreshToken: string,
+  regionInfo: RegionInfo
+): Promise<AudioUploadResult> {
+  try {
+    logger.info(`开始从URL下载并上传音频: ${util.safeURLLabel(audioUrl)}`);
+    const audioResponse = await axios.get(audioUrl, {
+      responseType: "arraybuffer",
+      maxContentLength: 15 * 1024 * 1024,
+      maxBodyLength: 15 * 1024 * 1024,
+    });
+    if (audioResponse.status < 200 || audioResponse.status >= 300) {
+      throw new Error(`下载音频失败: ${audioResponse.status}`);
+    }
+    return await uploadAudioBuffer(audioResponse.data, refreshToken, regionInfo);
+  } catch (error: any) {
+    logger.error(`从URL上传音频失败 (${util.safeURLLabel(audioUrl)}): ${error.code || error.response?.status || String(error.message).replaceAll(audioUrl, util.safeURLLabel(audioUrl))}`);
+    throw new Error(`从URL上传音频失败: ${error.response?.status || error.code || String(error.message).replaceAll(audioUrl, util.safeURLLabel(audioUrl))}`);
   }
 }

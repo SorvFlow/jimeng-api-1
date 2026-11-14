@@ -823,7 +823,7 @@ export function checkResult(result: AxiosResponse) {
  *
  * @param authorization 认证字符串
  */
-export function tokenSplit(authorization: string) {
+export function tokenSplit(authorization: string, isEligible?: (token: string) => boolean) {
   const rawTokens = authorization.replace(/^Bearer\s+/i, "").split(",");
 
   return rawTokens.map((rawToken) => {
@@ -846,7 +846,7 @@ export function tokenSplit(authorization: string) {
     if (validation.accountId) {
       sessionToken = db.getAccountToken(validation.accountId);
     } else {
-      sessionToken = db.getRandomAccountToken();
+      sessionToken = db.getRandomAccountToken(isEligible);
     }
 
     if (!sessionToken) {

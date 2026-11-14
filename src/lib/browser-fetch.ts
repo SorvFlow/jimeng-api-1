@@ -102,7 +102,7 @@ export async function browserSignRequest(url: string, data: any, options: { cdpP
           patterns: [{ urlPattern: `*${targetPath}*`, requestStage: 'Request' }]
         });
 
-        ws.addEventListener('message', async (ev: MessageEvent) => {
+        ws.addEventListener('message', async (ev) => {
           const msg = JSON.parse(String(ev.data));
           if (msg.method !== 'Fetch.requestPaused') return;
           const p = msg.params;

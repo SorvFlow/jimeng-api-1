@@ -2,7 +2,8 @@ import _ from 'lodash';
 
 import Request from '@/lib/request/Request.ts';
 import Response from '@/lib/response/Response.ts';
-import { tokenSplit } from '@/api/controllers/core.ts';
+import { parseRegionFromToken, tokenSplit } from '@/api/controllers/core.ts';
+import { isSeedance25Model } from '@/api/consts/seedance25.ts';
 import { createCompletion, createCompletionStream } from '@/api/controllers/chat.ts';
 import { selectToken, estimateCredits } from '@/lib/load-balancer.ts';
 
@@ -17,8 +18,11 @@ export default {
                 .validate('body.model', v => _.isUndefined(v) || _.isString(v))
                 .validate('body.messages', _.isArray)
                 .validate('headers.authorization', _.isString)
-            const tokens = tokenSplit(request.headers.authorization);
             const { model, messages, stream } = request.body;
+            const eligible = isSeedance25Model(model)
+                ? (token: string) => parseRegionFromToken(token).isInternational : undefined;
+            const tokens = tokenSplit(request.headers.authorization, eligible).filter(token => !eligible || eligible(token));
+            if (eligible && tokens.length === 0) throw new Error('Seedance 2.5 模型需要 Dreamina 国际站账号');
 
             // 积分感知选择 token（含代理绑定）
             const isVideo = model && model.startsWith('jimeng-video');

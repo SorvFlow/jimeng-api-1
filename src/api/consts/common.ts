@@ -93,6 +93,8 @@ export const VIDEO_MODEL_MAP = {
 export const VIDEO_MODEL_MAP_US = {
   "jimeng-video-3.5-pro": "dreamina_ic_generate_video_model_vgfm_3.5_pro",
   "jimeng-video-3.0": "dreamina_ic_generate_video_model_vgfm_3.0",
+  "jimeng-video-seedance-2.5": "dreamina_seedance_45_pro",
+  "jimeng-video-seedance-2.5-flash": "dreamina_seedance_45_flash",
 };
 
 // 视频模型映射 - 亚洲国际站 (HK/JP/SG/VN)
@@ -105,7 +107,9 @@ export const VIDEO_MODEL_MAP_ASIA = {
   "jimeng-video-3.0": "dreamina_ic_generate_video_model_vgfm_3.0",
   "jimeng-video-3.0-fast": "dreamina_ic_generate_video_model_vgfm_3.0_fast",
   "jimeng-video-2.0": "dreamina_ic_generate_video_model_vgfm_lite",
-  "jimeng-video-2.0-pro": "dreamina_ic_generate_video_model_vgfm1.0"
+  "jimeng-video-2.0-pro": "dreamina_ic_generate_video_model_vgfm1.0",
+  "jimeng-video-seedance-2.5": "dreamina_seedance_45_pro",
+  "jimeng-video-seedance-2.5-flash": "dreamina_seedance_45_flash",
 };
 
 // 状态码映射

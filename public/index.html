@@ -960,8 +960,8 @@ user3@example.com,password3"></textarea></div>
           },
           {
             method: "POST", path: "/v1/videos/generations", title: "视频生成",
-            desc: "视频生成接口。支持分辨率（1080p→720p→480p）与时长自动降级。时长限制因模型而异：多数模型支持 5/10 秒，seedance-2.0 系列支持 4–15 秒，veo3 系列仅 8 秒，sora2 支持 4/8/12 秒。支持 multipart 上传首/尾帧图片，或 functionMode=omni_reference 全能参考模式（最多 9 图 + 3 视频）。",
-            example: `curl ${base}/v1/videos/generations \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "jimeng-video-3.0",\n    "prompt": "海浪拍打礁石，电影质感",\n    "resolution": "1080p",\n    "duration": 5\n  }'`
+            desc: "视频生成接口。国际站 Seedance 2.5 / Flash 支持 4–30 秒、六种画幅及可选 seed。Pro 支持 480p/720p/1080p，4k 受上游权益控制；Flash 支持 480p/720p。functionMode=first_last_frames 为首尾帧，omni_reference 为混合参考。图片、视频、音频的 OSS URL 分别放入 image_file_N、video_file_N、audio_file_N；file_paths 仅接收图片。Pro 最多 30 图/10 视频/10 音频，Flash 最多 10 图/5 视频/5 音频。音频底层上传仍待账号实测。完整参数与来源差异见仓库中文文档 docs/seedance-2.5-models.md。",
+            example: `curl ${base}/v1/videos/generations \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "jimeng-video-seedance-2.5-flash",\n    "prompt": "让 @image_file_1 中的海浪轻拍礁石，电影质感",\n    "functionMode": "omni_reference",\n    "image_file_1": "https://oss.example.com/reference.jpg",\n    "ratio": "16:9",\n    "resolution": "720p",\n    "duration": 5,\n    "seed": 12345\n  }'`
           },
           {
             method: "GET", path: "/v1/models", title: "模型列表",
@@ -998,8 +998,8 @@ user3@example.com,password3"></textarea></div>
         result: "处理结果", model: "模型", category: "类型", accountId: "即梦账号 ID",
         requestedResolution: "配置分辨率（含默认）", requestedRatio: "配置比例（含默认）", requestedDurationSeconds: "配置时长（含默认）",
         functionMode: "生成模式", responseFormat: "返回格式", stream: "流式请求",
-        inputImageCount: "输入图片数", inputVideoCount: "输入视频数", messageCount: "消息数",
-        promptLength: "提示词字符数", outputCount: "输出数", estimatedCredits: "规则预估积分",
+        inputImageCount: "输入图片数", inputVideoCount: "输入视频数", inputAudioCount: "输入音频数", messageCount: "消息数",
+        promptLength: "提示词字符数", outputCount: "输出数", failedOutputCount: "失败输出数", estimatedCredits: "规则预估积分",
         actualCredits: "实际扣费", errorCode: "业务错误码",
       };
       function formatLogDetail(key, value) {
@@ -1008,7 +1008,7 @@ user3@example.com,password3"></textarea></div>
         if (key === "requestedDurationSeconds") return `${value} 秒`;
         if (key === "stream") return value ? "是" : "否";
         if (key === "result") return {
-          failed: "失败", completed: "请求已完成", stream_started: "已建立流，最终结果未确认",
+          failed: "失败", partial: "部分完成（批次已停止）", completed: "请求已完成", stream_started: "已建立流，最终结果未确认",
           response_sent: "已返回响应，任务结果未确认",
         }[value] || "未知";
         if (key === "category") return { image: "图片", video: "视频", unknown: "未知" }[value] || "未知";

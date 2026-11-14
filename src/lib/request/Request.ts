@@ -31,7 +31,7 @@ export default class Request {
     /** 请求载荷 */
     body: any;
     /** 上传的文件 */
-    files: any[];
+    files: Record<string, any>;
     /** 客户端IP地址 */
     remoteIP: string | null;
     /** 请求接受时间戳（毫秒） */
