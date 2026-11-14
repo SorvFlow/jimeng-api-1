@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const loader = require('./helpers/load-ts.cjs');
 
-function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openError, profiles, extraEnv = {}, createResponses = [] } = {}) {
+function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openError, openResponses = [], detailResponse, proxyUpdateResponse, profiles, extraEnv = {}, createResponses = [] } = {}) {
   const calls = [];
   const stubs = {
     ws: class WebSocket {},
@@ -19,6 +19,13 @@ function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openErro
             const response = createResponses.shift();
             return response;
           }
+          if (endpoint === '/browser/detail') {
+            return detailResponse || { status: 200, data: { success: true, data: null } };
+          }
+          if (endpoint === '/browser/proxy/update') {
+            return proxyUpdateResponse || { status: 200, data: { success: true, data: {} } };
+          }
+          if (endpoint === '/browser/open' && openResponses.length) return openResponses.shift();
           if (openError) return { status: 400, data: { success: false, msg: openError } };
           return { status: 200, data: { success: true, data: openData } };
         },
@@ -96,9 +103,8 @@ test('BitBrowser API 错误响应按 msg 失败，不伪装成空窗口', async 
   await assert.rejects(api.client.open('profile-4'), /profile is already opening/);
 });
 
-test('无代理 Profile 遇到 dynamicIpUrl 要求时省略代理字段重试', async () => {
+test('新建直连 Profile 首次使用官方自定义无代理参数', async () => {
   const api = clientFor({ createResponses: [
-    { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
     { status: 200, data: { success: true, data: { id: 'auto-created' } } },
   ] });
 
@@ -108,12 +114,18 @@ test('无代理 Profile 遇到 dynamicIpUrl 要求时省略代理字段重试', 
 
   assert.equal(result.id, 'auto-created');
   const createCalls = api.calls.filter(call => call.endpoint === '/browser/update');
-  assert.equal(createCalls.length, 2);
-  assert.equal(createCalls[0].body.proxyMethod, 3);
+  assert.equal(createCalls.length, 1);
+  assert.equal(createCalls[0].body.proxyMethod, 2);
   assert.equal(createCalls[0].body.proxyType, 'noproxy');
-  assert.equal(Object.hasOwn(createCalls[1].body, 'proxyMethod'), false);
-  assert.equal(Object.hasOwn(createCalls[1].body, 'proxyType'), false);
-  assert.equal(Object.hasOwn(createCalls[1].body, 'dynamicIpUrl'), false);
+  assert.equal(Object.hasOwn(createCalls[0].body, 'dynamicIpUrl'), false);
+});
+
+test('新建直连 Profile 遇到 dynamicIpUrl 不省略代理字段进行第二次创建', async () => {
+  const api = clientFor({ createResponses: [
+    { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
+  ] });
+  await assert.rejects(api.client.createProfileForAccount({ login_username: 'manual@example.com' }), /dynamicIpUrl/);
+  assert.deepEqual(api.calls.map(call => call.endpoint), ['/browser/update']);
 });
 
 test('显式代理遇到 dynamicIpUrl 不会被重试为无代理', async () => {
@@ -145,6 +157,120 @@ test('无代理 Profile 遇到其他 BitBrowser 错误不会触发第二次创�
     /invalid profile name/,
   );
   assert.equal(api.calls.filter(call => call.endpoint === '/browser/update').length, 1);
+});
+
+function legacyNoProxyDetail(overrides = {}) {
+  return {
+    id: 'legacy-profile',
+    remark: 'auto-created by jimeng-api / hk',
+    proxyMethod: 3,
+    proxyType: 'noproxy',
+    host: '',
+    port: 0,
+    proxyUserName: '',
+    proxyPassword: '',
+    dynamicIpUrl: '',
+    isGlobalProxyInfo: false,
+    ...overrides,
+  };
+}
+
+function legacyProfileClient({ detail = legacyNoProxyDetail(), ...options } = {}) {
+  return clientFor({
+    openResponses: [
+      { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
+      { status: 200, data: { success: true, data: { http: '127.0.0.1:39140' } } },
+    ],
+    detailResponse: { status: 200, data: { success: true, data: detail } },
+    ...options,
+  });
+}
+
+test('账号正常打开 Profile 时不读取详情或修改代理', async () => {
+  const api = clientFor({ openData: { http: '127.0.0.1:39139' } });
+  const result = await api.client.openForAccount('legacy-profile', { proxy_url: '' });
+  assert.equal(result.cdpPort, 39139);
+  assert.deepEqual(api.calls.map(call => call.endpoint), ['/browser/open']);
+});
+
+test('仅修复本系统自动创建的旧直连枚举，保留 Profile 并报告进度', async () => {
+  const api = legacyProfileClient({ detail: legacyNoProxyDetail({ ipCheckService: 'ip123in' }) });
+  const progress = [];
+  const result = await api.client.openForAccount('legacy-profile', { proxy_url: '' }, message => progress.push(message));
+
+  assert.equal(result.cdpPort, 39140);
+  assert.deepEqual(api.calls.map(call => call.endpoint), [
+    '/browser/open', '/browser/detail', '/browser/proxy/update', '/browser/open',
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(api.calls[1].body)), { id: 'legacy-profile' });
+  assert.deepEqual(JSON.parse(JSON.stringify(api.calls[2].body)), {
+    ids: ['legacy-profile'], ipCheckService: 'ip123in', proxyMethod: 2, proxyType: 'noproxy',
+  });
+  assert.equal(api.calls[3].body.id, 'legacy-profile');
+  assert.match(progress.join(' '), /修复/);
+});
+
+test('修复旧直连配置时缺少 IP 查询渠道使用官方默认值', async () => {
+  const api = legacyProfileClient();
+  await api.client.openForAccount('legacy-profile', {});
+  assert.equal(api.calls.find(call => call.endpoint === '/browser/proxy/update').body.ipCheckService, 'ip-api');
+});
+
+test('账号配置代理或非 dynamicIpUrl 打开错误不会读取详情及修改代理', async () => {
+  const proxyAccount = legacyProfileClient();
+  await assert.rejects(proxyAccount.client.openForAccount('legacy-profile', { proxy_url: 'http://proxy.example:8080' }), /dynamicIpUrl/);
+  assert.deepEqual(proxyAccount.calls.map(call => call.endpoint), ['/browser/open']);
+
+  const otherError = clientFor({ openError: 'profile is already opening' });
+  await assert.rejects(otherError.client.openForAccount('legacy-profile', {}), /profile is already opening/);
+  assert.deepEqual(otherError.calls.map(call => call.endpoint), ['/browser/open']);
+});
+
+test('详情无法证明旧错误直连配置时拒绝自动修改', async t => {
+  const cases = [
+    ['详情为空', null],
+    ['Profile ID 不匹配', legacyNoProxyDetail({ id: 'other-profile' })],
+    ['用户手动创建', legacyNoProxyDetail({ remark: 'manual profile' })],
+    ['备注并非系统创建前缀', legacyNoProxyDetail({ remark: 'copy auto-created by jimeng-api / hk' })],
+    ['已是自定义代理模式', legacyNoProxyDetail({ proxyMethod: 2 })],
+    ['实际代理类型', legacyNoProxyDetail({ proxyType: 'http' })],
+    ['实际代理主机', legacyNoProxyDetail({ host: 'proxy.example' })],
+    ['实际代理端口', legacyNoProxyDetail({ port: 8080 })],
+    ['存在代理用户名', legacyNoProxyDetail({ proxyUserName: 'proxy-user' })],
+    ['存在代理密码', legacyNoProxyDetail({ proxyPassword: 'proxy-pass' })],
+    ['存在动态提取 URL', legacyNoProxyDetail({ dynamicIpUrl: 'https://proxy.example/extract' })],
+    ['使用全局代理', legacyNoProxyDetail({ isGlobalProxyInfo: true })],
+  ];
+  for (const [name, detail] of cases) {
+    await t.test(name, async () => {
+      const api = legacyProfileClient({ detail });
+      await assert.rejects(api.client.openForAccount('legacy-profile', {}), /dynamicIpUrl/);
+      assert.deepEqual(api.calls.map(call => call.endpoint), ['/browser/open', '/browser/detail']);
+    });
+  }
+});
+
+test('读取 Profile 详情失败时不会修改代理或重试打开', async () => {
+  const api = legacyProfileClient({ detailResponse: { status: 400, data: { success: false, msg: 'detail unavailable' } } });
+  await assert.rejects(api.client.openForAccount('legacy-profile', {}));
+  assert.deepEqual(api.calls.map(call => call.endpoint), ['/browser/open', '/browser/detail']);
+});
+
+test('代理专用修复失败时停止，不回退全量更新或重试打开', async () => {
+  const api = legacyProfileClient({ proxyUpdateResponse: { status: 400, data: { success: false, msg: 'proxy update denied' } } });
+  await assert.rejects(api.client.openForAccount('legacy-profile', {}), /proxy update denied/);
+  assert.deepEqual(api.calls.map(call => call.endpoint), ['/browser/open', '/browser/detail', '/browser/proxy/update']);
+});
+
+test('修复后再次打开失败时不会循环修复或再次创建窗口', async () => {
+  const api = legacyProfileClient({ openResponses: [
+    { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
+    { status: 400, data: { success: false, msg: 'second open failed: dynamicIpUrl' } },
+  ] });
+  await assert.rejects(api.client.openForAccount('legacy-profile', {}), /second open failed/);
+  assert.deepEqual(api.calls.map(call => call.endpoint), [
+    '/browser/open', '/browser/detail', '/browser/proxy/update', '/browser/open',
+  ]);
 });
 
 test('Profile 自动绑定只接受唯一精确匹配，不按相似名称猜账号', async () => {

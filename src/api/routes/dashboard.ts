@@ -71,6 +71,14 @@ function updateLoginProgress(accountId: number, message: string, progress?: any)
   }
 }
 
+function formatBitBrowserOperationError(action: string, error: any, fallbackHint = ''): string {
+  const raw = String(error?.message || error || '未知错误').trim();
+  if (/dynamicIpUrl|提取URL/i.test(raw)) {
+    return `${action}失败：BitBrowser Profile 代理配置不完整（缺少动态提取 URL：dynamicIpUrl）：${raw}。请在 BitBrowser 中将该 Profile 改为直连/静态代理，或填写代理商提供的动态提取 URL 后再重试`;
+  }
+  return `${action}失败：${raw}${fallbackHint ? `；${fallbackHint}` : ''}`;
+}
+
 
 function parseLoginAccountLines(raw: string): any[] {
   return String(raw || '').split(/\n+/).map((line) => {
@@ -419,16 +427,28 @@ export default {
       try {
         const client = new BitBrowserClient();
         const resolved = await resolveBitBrowserProfile(account, client);
-        const opened = await client.open(resolved.profileId);
+        let repaired = false;
+        const opened = await client.openForAccount(resolved.profileId, account, message => {
+          repaired = true;
+          updateLoginProgress(Number(id), message, { stage: 'opening_browser', percent: 15, status: 'logging_in' });
+        });
         db.updateAccountBitBrowserRuntime(Number(id), {
           cdp_port: opened.cdpPort || 0,
           cdp_ws_url: '',
           bitbrowser_window_id: resolved.profileId
         });
+        if (repaired) {
+          db.updateAccountLoginStatus(Number(id), 'need_2fa', 'BitBrowser 代理配置已修复，窗口已打开；请完成 Dreamina 登录后点击“检测”');
+        }
         return { success: true, autoBound: resolved.autoBound, matchedProfile: resolved.matchedProfile ? { id: resolved.matchedProfile.id, name: resolved.matchedProfile.name, seq: resolved.matchedProfile.seq } : undefined, runningContext: resolved.runningContext, data: opened };
       } catch (e) {
-        db.updateAccountLoginStatus(Number(id), 'failed', e.message);
-        return new Response({ error: '打开 BitBrowser 失败: ' + e.message }, { statusCode: 500 });
+        const message = formatBitBrowserOperationError(
+          '打开 BitBrowser',
+          e,
+          '请确认 BitBrowser API 服务及该 Profile 可用',
+        );
+        db.updateAccountLoginStatus(Number(id), 'failed', message);
+        return new Response({ error: message }, { statusCode: 500 });
       }
     },
 
@@ -466,6 +486,7 @@ export default {
           });
           const result = await loginDreaminaViaBitBrowser({
             bitbrowserProfileId: resolved.profileId,
+            proxyUrl: account.proxy_url,
             username: account.login_username,
             password: db.decryptSecret(account.login_password || ''),
             onOpened: (runtime) => {
@@ -505,7 +526,7 @@ export default {
             result.message || (result.status === 'failed' ? '登录未确认' : ''),
           );
         } catch (e) {
-          db.updateAccountLoginStatus(accountId, 'failed', e.message);
+          db.updateAccountLoginStatus(accountId, 'failed', formatBitBrowserOperationError('Dreamina 登录', e));
         } finally {
           loginTasks.delete(accountId);
         }
@@ -550,7 +571,9 @@ export default {
           updateLoginProgress(Number(id), '正在重新连接已绑定 BitBrowser 窗口', {
             stage: 'connecting_cdp', percent: 35, status: 'logging_in'
           });
-          const opened = await new BitBrowserClient().open(profileId);
+          const opened = await new BitBrowserClient().openForAccount(profileId, account, message => {
+            updateLoginProgress(Number(id), message, { stage: 'connecting_cdp', percent: 35, status: 'logging_in' });
+          });
           if (!opened.cdpPort) {
             throw new Error(`已绑定 Profile 未返回有效 CDP 端口${firstCheckError ? `；旧端口检测失败：${firstCheckError.message}` : ''}`);
           }
@@ -590,7 +613,11 @@ export default {
         );
         return { success: result.status === 'ok', ...result, message };
       } catch (e) {
-        const message = '检测绑定账号窗口失败: ' + e.message + '；请确认该账号的 BitBrowser 窗口及 CDP 端口可从 API 服务器访问';
+        const message = formatBitBrowserOperationError(
+          '检测绑定账号窗口',
+          e,
+          '请确认该账号的 BitBrowser 窗口及 CDP 端口可从 API 服务器访问',
+        );
         db.updateAccountLoginStatus(Number(id), 'failed', message);
         return new Response({ error: message }, { statusCode: 500 });
       }

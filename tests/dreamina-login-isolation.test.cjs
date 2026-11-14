@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const loader = require('./helpers/load-ts.cjs');
 
 function setup(overrides = {}) {
-  const calls = { open: [], check: [], discovery: [], token: [], cookie: [], runtime: [], status: [], progress: [] };
+  const calls = { open: [], openAccounts: [], check: [], discovery: [], token: [], cookie: [], runtime: [], status: [], progress: [] };
   const account = {
     id: 9, name: 'manual-test', region: 'sg', login_username: 'manual@example.com',
     bitbrowser_profile_id: 'profile-9', bitbrowser_window_id: 'profile-9',
@@ -21,6 +21,11 @@ function setup(overrides = {}) {
     updateAccountCookie: (...args) => calls.cookie.push(args),
   };
   class FakeBitBrowserClient {
+    async openForAccount(id, account, onProgress) {
+      calls.openAccounts.push(account);
+      if (overrides.repairProgress) await onProgress?.('正在修复 BitBrowser 旧版无代理 Profile 配置');
+      return this.open(id);
+    }
     async open(id) {
       calls.open.push(id);
       if (overrides.openError) throw new Error(overrides.openError);
@@ -60,10 +65,12 @@ function setup(overrides = {}) {
     '@/lib/consts/exceptions.ts': { SYSTEM_UNAUTHORIZED: [-1, 'unauthorized'] },
     '@/lib/http-status-codes.ts': { UNAUTHORIZED: 401 },
   }, { process: { ...process, env: { ...process.env, DREAMINA_CDP_PORT: '39999' } } });
-  const route = load('@/api/routes/dashboard.ts').default.post['/accounts/bitbrowser/check-login'];
+  const routes = load('@/api/routes/dashboard.ts').default.post;
+  const route = routes['/accounts/bitbrowser/check-login'];
   return {
     calls, account,
     check: () => route({ body: { id: account.id }, headers: { cookie: 'session=test-session' } }),
+    open: () => routes['/accounts/bitbrowser/open']({ body: { id: account.id }, headers: { cookie: 'session=test-session' } }),
   };
 }
 
@@ -90,6 +97,42 @@ test('绑定窗口不可用时明确报错，不回退保存端口或其他账�
   assert.equal(api.calls.check.length, 1);
   assert.equal(api.calls.token.length, 0);
   assert.equal(api.calls.status.at(-1)[1], 'failed');
+});
+
+test('绑定 Profile 缺少动态代理提取 URL 时提示修复 Profile，不误报为 CDP 网络故障', async () => {
+  const api = setup({ checkError: '请填写提取URL: dynamicIpUrl', openError: '请填写提取URL: dynamicIpUrl' });
+  const response = await api.check();
+  assert.equal(response.statusCode, 500);
+  assert.match(response.body.error, /代理配置不完整.*dynamicIpUrl/);
+  assert.match(response.body.error, /改为直连\/静态代理/);
+  assert.doesNotMatch(response.body.error, /CDP 端口可从 API 服务器访问/);
+  assert.equal(api.calls.status.at(-1)[1], 'failed');
+});
+
+test('打开绑定 Profile 遇到 dynamicIpUrl 时报告代理配置卡点', async () => {
+  const api = setup({ openError: '请填写提取URL: dynamicIpUrl' });
+  const response = await api.open();
+  assert.equal(response.statusCode, 500);
+  assert.match(response.body.error, /打开 BitBrowser失败：BitBrowser Profile 代理配置不完整/);
+  assert.doesNotMatch(response.body.error, /CDP 端口可从 API 服务器访问/);
+  assert.deepEqual(api.calls.status.at(-1), [9, 'failed', response.body.error]);
+});
+
+test('手动打开和检测均传入本账号代理上下文，并显示旧配置修复进度', async () => {
+  for (const action of ['open', 'check']) {
+    const api = setup({
+      account: { proxy_url: 'http://127.0.0.1:8080', cdp_port: 0 },
+      repairProgress: true,
+    });
+    const response = await api[action]();
+    assert.equal(response.success, true);
+    assert.equal(api.calls.openAccounts[0], api.account);
+    assert.ok(api.calls.progress.some(([id, message]) => id === 9 && /修复.*旧版无代理/.test(message)));
+    if (action === 'open') {
+      assert.equal(api.calls.status.at(-1)[1], 'need_2fa');
+      assert.match(api.calls.status.at(-1)[2], /已修复.*窗口已打开.*检测/);
+    }
+  }
 });
 
 test('只有账号专属 CDP 时只检测其保存端口，忽略全局端口', async () => {

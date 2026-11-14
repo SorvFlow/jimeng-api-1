@@ -139,7 +139,8 @@ function norm(v: any): string {
 
 function parseProxyUrl(proxyUrl?: string | null): Partial<Record<string, any>> {
   const raw = String(proxyUrl || '').trim();
-  if (!raw) return { proxyMethod: 3, proxyType: 'noproxy' };
+  // Local API: 2 = custom proxy (including noproxy), 3 = extract IP.
+  if (!raw) return { proxyMethod: 2, proxyType: 'noproxy' };
 
   // Support both standard URL form and the imported shorthand form:
   //   http://user:pass@host:port
@@ -164,7 +165,7 @@ function parseProxyUrl(proxyUrl?: string | null): Partial<Record<string, any>> {
   }
 
   // BitBrowser requires proxyType even when falling back to no-proxy.
-  return { proxyMethod: 3, proxyType: 'noproxy', remark: `Invalid proxy_url ignored: ${raw.slice(0, 80)}` };
+  return { proxyMethod: 2, proxyType: 'noproxy', remark: `Invalid proxy_url ignored: ${raw.slice(0, 80)}` };
 }
 
 function buildCreateProfilePayload(account: { name?: string; login_username?: string; username?: string; proxy_url?: string; region?: string }): any {
@@ -186,20 +187,6 @@ function buildCreateProfilePayload(account: { name?: string; login_username?: st
       openHeight: 900,
     },
   };
-}
-
-function buildNoProxyCreatePayload(payload: any): any {
-  const {
-    proxyMethod,
-    proxyType,
-    host,
-    port,
-    proxyUserName,
-    proxyPassword,
-    dynamicIpUrl,
-    ...rest
-  } = payload || {};
-  return rest;
 }
 
 function extractProfileId(data: any): string {
@@ -314,6 +301,55 @@ export class BitBrowserClient {
     return { ...data, cdpPort: extractPort(data), raw: res.data };
   }
 
+  async openForAccount(
+    id: string,
+    account: { proxy_url?: string | null },
+    onProgress?: (message: string) => void | Promise<void>,
+  ): Promise<BitBrowserOpenResult> {
+    try {
+      return await this.open(id);
+    } catch (error: any) {
+      const message = String(error?.message || error || '');
+      if (String(account.proxy_url || '').trim() || !/dynamicIpUrl|提取URL/i.test(message)) throw error;
+
+      // Repair only the exact invalid configuration created by older jimeng-api
+      // versions. Never replace a manually configured or working proxy.
+      let profile: any;
+      try {
+        const detail = await this.http.post('/browser/detail', { id });
+        if (!detail.data?.success) throw new Error(detail.data?.msg || `HTTP ${detail.status}`);
+        profile = detail.data.data;
+      } catch (detailError: any) {
+        throw new Error(`${message}；读取 Profile 代理配置失败：${detailError?.message || detailError}`);
+      }
+      const legacyNoProxy = String(profile?.id || '') === id
+        && /^auto-created by jimeng-api(?:\s|$)/.test(String(profile?.remark || ''))
+        && Number(profile?.proxyMethod) === 3 && profile?.proxyType === 'noproxy'
+        && !profile?.isGlobalProxyInfo
+        && !String(profile?.host || '').trim() && Number(profile?.port || 0) === 0
+        && !String(profile?.proxyUserName || '').trim() && !String(profile?.proxyPassword || '').trim()
+        && !String(profile?.dynamicIpUrl || '').trim();
+      if (!legacyNoProxy) throw error;
+
+      await onProgress?.('正在修复 BitBrowser 旧版无代理 Profile 配置');
+      logger.warn(`修复旧版 BitBrowser 无代理配置: ${id} (proxyMethod 3 -> 2)`);
+      try {
+        // The proxy-only endpoint preserves cookies, fingerprint and window
+        // settings. Do not send an incomplete profile to /browser/update.
+        const updated = await this.http.post('/browser/proxy/update', {
+          ids: [id],
+          ipCheckService: profile.ipCheckService || 'ip-api',
+          proxyMethod: 2,
+          proxyType: 'noproxy',
+        });
+        if (!updated.data?.success) throw new Error(updated.data?.msg || `HTTP ${updated.status}`);
+      } catch (updateError: any) {
+        throw new Error(`${message}；修复旧版无代理 Profile 失败：${updateError?.message || updateError}`);
+      }
+      return this.open(id);
+    }
+  }
+
   async close(id: string): Promise<void> {
     if (!id) throw new Error("BitBrowser profile id is required");
     const res = await this.http.post("/browser/close", { id });
@@ -333,20 +369,7 @@ export class BitBrowserClient {
   async createProfileForAccount(account: { name?: string; login_username?: string; username?: string; proxy_url?: string; region?: string }): Promise<any> {
     const payload = buildCreateProfilePayload(account);
     logger.info(`自动创建 BitBrowser profile: ${mask(payload.name)}`);
-    let data: any;
-    try {
-      data = await this.createOrUpdate(payload);
-    } catch (error: any) {
-      const hasProxy = payload.proxyMethod === 2;
-      const message = String(error?.message || error || '');
-      // Some BitBrowser builds interpret proxyMethod=3 as dynamic proxy and
-      // reject a no-proxy profile because dynamicIpUrl is missing. Retry only
-      // for accounts without a proxy, leaving explicitly configured proxies
-      // untouched and avoiding a second create request for unrelated errors.
-      if (hasProxy || !/dynamicIpUrl|提取URL/i.test(message)) throw error;
-      logger.warn('BitBrowser 无代理创建被识别为动态代理，重试时省略全部代理字段');
-      data = await this.createOrUpdate(buildNoProxyCreatePayload(payload));
-    }
+    const data = await this.createOrUpdate(payload);
     const profileId = extractProfileId(data);
     if (profileId) return { ...data, id: profileId, autoCreatedPayload: { name: payload.name, url: payload.url, proxyType: payload.proxyType, host: payload.host, port: payload.port } };
 
@@ -815,6 +838,7 @@ export async function checkDreaminaLoginByCdp(cdpPort: number, cdpWsUrl?: string
 
 export async function loginDreaminaViaBitBrowser(options: {
   bitbrowserProfileId: string;
+  proxyUrl?: string;
   username?: string;
   password?: string;
   loginUrl?: string;
@@ -832,7 +856,7 @@ export async function loginDreaminaViaBitBrowser(options: {
   };
   logger.info(`打开 BitBrowser profile: ${options.bitbrowserProfileId}`);
   await reportProgress('正在打开 BitBrowser');
-  const opened = await client.open(options.bitbrowserProfileId);
+  const opened = await client.openForAccount(options.bitbrowserProfileId, { proxy_url: options.proxyUrl }, reportProgress);
   if (!opened.cdpPort) throw new Error("BitBrowser open did not return CDP port");
 
   const openedWs = opened.ws && opened.ws.includes('/devtools/page/')

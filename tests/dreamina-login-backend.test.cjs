@@ -17,6 +17,7 @@ function setup({ login }) {
     login_username: 'user@example.com',
     login_password: 'encrypted-password',
     bitbrowser_profile_id: 'profile-7',
+    proxy_url: 'http://127.0.0.1:8080',
     region: 'sg',
   };
   const db = {
@@ -83,6 +84,7 @@ test('登录任务立即返回 pending，窗口打开和阶段进度先落库，
 
   assert.deepEqual(api.calls.status[0], [7, 'logging_in', '登录任务已启动']);
   assert.ok(api.calls.login.length, 'detached login task should start');
+  assert.equal(api.calls.login[0].proxyUrl, api.account.proxy_url, '自动登录必须传递账号代理上下文');
   assert.ok(api.calls.runtime.some(([id, runtime]) => id === 7 && runtime.cdp_port === 19222),
     'onOpened should persist the CDP port before login finishes');
   assert.ok(api.calls.progress.some(([id, message]) => id === 7 && message === '正在连接 BitBrowser'),
@@ -111,13 +113,24 @@ test('登录异常会写入具体原因并释放防重锁，之后可以重试',
 
   await api.route(api.request());
   await flush();
-  assert.deepEqual(api.calls.status.at(-1), [7, 'failed', '邮箱登录表单未出现']);
+  assert.deepEqual(api.calls.status.at(-1), [7, 'failed', 'Dreamina 登录失败：邮箱登录表单未出现']);
 
   const retry = await api.route(api.request());
   assert.equal(retry.pending, true, 'completed task must be removed from loginTasks');
   await flush();
   assert.equal(attempts, 2);
   assert.deepEqual(api.calls.status.at(-1), [7, 'need_2fa', '等待验证码']);
+});
+
+test('自动登录遇到 dynamicIpUrl 时提示修复 Profile 代理配置', async () => {
+  const api = setup({ login: async () => { throw new Error('请填写提取URL: dynamicIpUrl'); } });
+  await api.route(api.request());
+  await flush();
+
+  const message = api.calls.status.at(-1)[2];
+  assert.match(message, /代理配置不完整.*dynamicIpUrl/);
+  assert.match(message, /改为直连\/静态代理/);
+  assert.doesNotMatch(message, /CDP 端口可从 API 服务器访问/);
 });
 
 test('登录结果兼容不同 Dreamina 会话 Cookie 名称，并按优先级保存 token', async () => {
