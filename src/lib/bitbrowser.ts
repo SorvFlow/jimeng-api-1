@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import axios, { AxiosInstance } from "axios";
 import logger from "@/lib/logger.ts";
 import db from "@/lib/database.ts";
-import { cdpCall, getCdpHttpBase, getGeneratePageWs, rewriteCdpWsUrl } from "@/lib/browser-fetch.ts";
+import { cdpCall, getCdpHttpBase, getCdpTargets, getGeneratePageWs, rewriteCdpWsUrl } from "@/lib/browser-fetch.ts";
 
 export interface BitBrowserOpenResult {
   ws?: string;
@@ -31,10 +31,25 @@ export interface RunningDreaminaContext {
   title?: string;
 }
 
-const DEFAULT_LOGIN_URL = "https://dreamina.capcut.com/ai-tool/home?need_login=true";
+// Use the public Dreamina entry point supplied by the user. The page may show
+// the sign-in CTA instead of opening the modal automatically; the automation
+// below handles that CTA explicitly. Keep the URL configurable for deployments
+// that need a regional mirror or a temporary query parameter.
+const DEFAULT_LOGIN_URL = "https://dreamina.capcut.com/ai-tool/home";
+
+function getDreaminaLoginUrl(explicit?: string): string {
+  return String(explicit || process.env.DREAMINA_LOGIN_URL || db.getSetting('dreamina_login_url', DEFAULT_LOGIN_URL) || DEFAULT_LOGIN_URL).trim();
+}
 
 function getBaseUrl() {
   return process.env.BITBROWSER_API_BASE || db.getSetting('bitbrowser_api_base', 'http://127.0.0.1:54345');
+}
+
+function isPrivateIPv4(host: string): boolean {
+  const parts = host.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10 || parts[0] === 192 && parts[1] === 168
+    || parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
 }
 
 function mask(value?: string | null) {
@@ -43,12 +58,17 @@ function mask(value?: string | null) {
 }
 
 function extractPort(openData: any): number | undefined {
-  const http = String(openData?.http || "");
-  const match = http.match(/:(\d+)$/) || http.match(/^(\d+)$/);
-  if (match) return Number(match[1]);
-  const ws = String(openData?.ws || "");
-  const wsMatch = ws.match(/:(\d+)\//);
-  return wsMatch ? Number(wsMatch[1]) : undefined;
+  const candidates = [openData?.cdpPort, openData?.cdp_port,
+    openData?.http, openData?.debuggerAddress, openData?.debugger_address, openData?.ws];
+  for (const candidate of candidates) {
+    const raw = String(candidate || "");
+    const match = raw.match(/:(\d+)(?:\/|$)/) || raw.match(/^(\d+)$/);
+    if (match) {
+      const port = Number(match[1]);
+      if (port > 0 && port < 65536) return port;
+    }
+  }
+  return undefined;
 }
 
 function cdpBaseFromBitBrowserApi(bitbrowserApiBase: string, cdpPort: number): string {
@@ -62,39 +82,59 @@ function getOpenArgs(): string[] {
     ? raw.split(/\s*,\s*/).map(v => v.trim()).filter(Boolean)
     : [];
 
-  // For remote API deployments, CDP must listen on a non-loopback address;
-  // otherwise /browser/open returns a port that is only reachable from the BitBrowser machine itself.
   if (!args.some(a => a.startsWith('--remote-debugging-address='))) {
-    args.push('--remote-debugging-address=0.0.0.0');
+    const explicitAddress = process.env.BITBROWSER_CDP_BIND_ADDRESS || db.getSetting('bitbrowser_cdp_bind_address', '');
+    if (explicitAddress) {
+      args.push(`--remote-debugging-address=${explicitAddress}`);
+    } else {
+      try {
+        const apiHost = new URL(getBaseUrl()).hostname;
+        if (apiHost === 'localhost' || apiHost === '127.0.0.1' || apiHost === '::1') {
+          args.push('--remote-debugging-address=127.0.0.1');
+        } else if (isPrivateIPv4(apiHost)) {
+          args.push(`--remote-debugging-address=${apiHost}`);
+        }
+      } catch { /* Leave Chromium's loopback default for an unrecognized API host. */ }
+    }
   }
   return args;
 }
 
-async function hasDreaminaPage(cdpBase: string): Promise<boolean> {
+async function hasDreaminaPage(cdpPort: number): Promise<boolean> {
   try {
-    const tabs = await fetch(`${cdpBase.replace(/\/$/, "")}/json/list`).then(r => r.json()) as any[];
+    const tabs = await getCdpTargets(cdpPort, 5000);
     return tabs.some(t => t.type === 'page' && String(t.url || '').includes('dreamina.capcut.com'));
   } catch {
     return false;
   }
 }
 
+function isCapcutDomain(value: any): boolean {
+  const domain = String(value || '').toLowerCase().replace(/^\./, '');
+  return domain === 'capcut.com' || domain.endsWith('.capcut.com')
+    || domain === 'dreamina.com' || domain.endsWith('.dreamina.com');
+}
+
+function validDreaminaCookies(cookies: any[]): any[] {
+  const now = Date.now() / 1000;
+  return cookies.filter(c => {
+    if (!isCapcutDomain(c?.domain) || String(c?.value ?? '').trim() === '') return false;
+    // Chromium uses a negative expiry for session cookies. Never let an old
+    // persistent cookie (or a same-named TikTok cookie in this Profile) pass.
+    const expires = Number(c.expires);
+    return c.expires === undefined || (Number.isFinite(expires)
+      && (expires < 0 || expires > now || (expires === 0 && c.session === true)));
+  });
+}
+
 function cookieHeaderFromCdp(cookies: any[]): string {
-  return cookies
-    .filter(c => String(c.domain || "").includes("capcut.com") || String(c.domain || "").includes("dreamina"))
+  return validDreaminaCookies(cookies)
     .map(c => `${c.name}=${c.value}`)
     .join("; ");
 }
 
 function norm(v: any): string {
   return String(v || "").trim().toLowerCase();
-}
-
-function profileSearchText(profile: any): string {
-  return [
-    profile.id, profile.seq, profile.name, profile.userName, profile.username,
-    profile.remark, profile.platform, profile.url, profile.code
-  ].map(norm).join(" ");
 }
 
 function parseProxyUrl(proxyUrl?: string | null): Partial<Record<string, any>> {
@@ -199,21 +239,21 @@ export class BitBrowserClient {
   async findProfileForAccount(account: { name?: string; login_username?: string; username?: string; token_preview?: string }): Promise<any | null> {
     const targets = [account.login_username, account.username, account.name]
       .map(norm)
+      .filter((target, index, all) => all.indexOf(target) === index)
       .filter(v => v && v !== "unknown");
     if (!targets.length) return null;
 
     const profiles = await this.listAll();
 
-    // 1. 优先精确匹配 name / userName。
-    for (const profile of profiles) {
-      const fields = [profile.name, profile.userName, profile.username].map(norm);
-      if (targets.some(t => fields.includes(t))) return profile;
-    }
-
-    // 2. 其次在 name / remark / url 等字段里包含匹配。
-    for (const profile of profiles) {
-      const haystack = profileSearchText(profile);
-      if (targets.some(t => t.length >= 4 && haystack.includes(t))) return profile;
+    // Prefer exact email/username matches; never bind by a partial name when
+    // several BitBrowser Profiles could belong to different accounts.
+    for (const target of targets) {
+      const matches = profiles.filter(profile =>
+        [profile.name, profile.userName, profile.username].map(norm).includes(target));
+      if (matches.length > 1) {
+        throw new Error(`BitBrowser 中有多个 Profile 精确匹配账号标识 ${mask(target)}，请手动绑定 Profile ID`);
+      }
+      if (matches.length === 1) return matches[0];
     }
 
     return null;
@@ -234,7 +274,7 @@ export class BitBrowserClient {
         const opened = await this.open(String(profile.id));
         if (!opened.cdpPort) continue;
         const cdpBase = cdpBaseFromBitBrowserApi(this.http.defaults.baseURL || getBaseUrl(), opened.cdpPort);
-        const dreamina = await hasDreaminaPage(cdpBase);
+        const dreamina = await hasDreaminaPage(opened.cdpPort);
         const result = { cdpBase, profileId: String(profile.id), cdpPort: opened.cdpPort, opened, hasDreaminaPage: dreamina };
         if (dreamina) return result;
         if (!firstReachable) {
@@ -304,7 +344,7 @@ function getCandidateCdpPorts(extra?: Array<number | string | null | undefined>)
 export async function discoverRunningDreaminaContext(extraPorts: Array<number | string | null | undefined> = []): Promise<RunningDreaminaContext | null> {
   for (const port of getCandidateCdpPorts(extraPorts)) {
     try {
-      const tabs = await fetch(`${getCdpHttpBase(port)}/json/list`).then(r => r.json()) as any[];
+      const tabs = await getCdpTargets(port, 5000);
       const dreaminaPage = tabs.find(t => t.type === 'page' && String(t.url || '').includes('dreamina.capcut.com'));
       if (!dreaminaPage) continue;
       const workbench = tabs.find(t => t.type === 'page' && String(t.url || '').includes('console.bitbrowser.net'));
@@ -338,6 +378,28 @@ async function waitForPageWs(port: number, timeoutMs = 60000): Promise<string> {
     }
   }
   throw lastError || new Error(`Dreamina page not found on CDP port ${port}`);
+}
+
+/** Return any usable page target, including a blank tab opened by BitBrowser. */
+async function waitForAnyPageWs(port: number, timeoutMs = 15000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: any;
+  while (Date.now() < deadline) {
+    try {
+      const tabs = await getCdpTargets(port, 5000);
+      const target = tabs.find(t => t.type === 'page' && /\/scan-qr-code(?:[/?]|$)/i.test(String(t.url || '')))
+        || tabs.find(t => t.type === 'page' && String(t.url || '').includes('/ai-tool/generate'))
+        || tabs.find(t => t.type === 'page' && String(t.url || '').includes('dreamina.capcut.com'))
+        || tabs.find(t => t.type === 'page' && /(?:^|[/:.])capcut\.com(?:\/|$)/i.test(String(t.url || '')))
+        || tabs.find(t => t.type === 'page' && t.webSocketDebuggerUrl);
+      if (target?.webSocketDebuggerUrl) return rewriteCdpWsUrl(target.webSocketDebuggerUrl, port);
+      lastError = new Error(`No page target on CDP port ${port}`);
+    } catch (e) {
+      lastError = e;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw lastError || new Error(`No page target on CDP port ${port}`);
 }
 
 async function evalOnPage<T = any>(ws: WebSocket, expression: string, timeoutMs = 30000, contextId?: number): Promise<T> {
@@ -390,11 +452,72 @@ async function collectExecutionContexts(ws: WebSocket, waitMs = 1200): Promise<A
   return [undefined, ...ids];
 }
 
-async function navigateAndWait(ws: WebSocket, url: string) {
+function isCdpNavigationError(error: any): boolean {
+  return /execution context.*(?:destroyed|not found|does not exist)|cannot find context|cannot find.*id|target.*(?:closed|not found)|session.*closed|websocket.*(?:closed|not open|error)|CDP connection closed/i.test(String(error?.message || error));
+}
+
+async function connectPageWebSocket(url: string): Promise<WebSocket> {
+  const socket = new WebSocket(url);
+  // A target can disappear between calls; cdpCall reports errors while a call
+  // is pending, and this listener keeps an idle transport error from escaping.
+  socket.on('error', () => {});
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error('CDP websocket connection timeout')), 10000);
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      socket.removeListener('open', onOpen);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+      if (error) {
+        socket.once('error', () => {});
+        try { socket.close(); } catch {}
+        reject(error);
+      } else resolve(socket);
+    };
+    const onOpen = () => finish();
+    const onError = () => finish(new Error('CDP websocket error'));
+    const onClose = () => finish(new Error('CDP connection closed'));
+    socket.once('open', onOpen);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+  });
+}
+
+async function navigateAndWait(ws: WebSocket, url: string, reconnect?: () => Promise<WebSocket>): Promise<WebSocket> {
   await cdpCall(ws, "Page.enable");
   await cdpCall(ws, "Runtime.enable");
-  await cdpCall(ws, "Page.navigate", { url });
-  await new Promise(r => setTimeout(r, 5000));
+  try {
+    await cdpCall(ws, "Page.navigate", { url });
+  } catch (error) {
+    if (!reconnect || !isCdpNavigationError(error)) throw error;
+    ws = await reconnect();
+  }
+  // The Dreamina shell is client-rendered and may take longer than the
+  // navigation response, especially through a remote BitBrowser proxy. Wait
+  // for a usable body/login surface instead of racing the first 5 seconds.
+  const configured = Number(process.env.DREAMINA_LOGIN_PAGE_WAIT_MS || 20000);
+  const timeoutMs = Number.isFinite(configured) && configured >= 5000 ? configured : 20000;
+  const deadline = Date.now() + timeoutMs;
+  let lastState: any = null;
+  // Give Chromium a turn to swap the document before inspecting readyState;
+  // otherwise the old page can report `complete` immediately after navigate.
+  await new Promise(r => setTimeout(r, 300));
+  if (reconnect) ws = await reconnect();
+  while (Date.now() < deadline) {
+    lastState = await evalOnPage<any>(ws, `(() => ({
+      ready: document.readyState,
+      hasBody: !!document.body,
+      textLength: document.body ? (document.body.innerText || '').trim().length : 0,
+      controls: document.querySelectorAll('button,input,[role=button]').length
+    }))()`, 5000).catch(async error => {
+      if (reconnect && isCdpNavigationError(error)) ws = await reconnect();
+      return null;
+    });
+    if (lastState?.hasBody && (lastState.textLength > 20 || lastState.controls > 0)) return ws;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  logger.warn(`Dreamina 页面在 ${timeoutMs}ms 内未完全就绪，继续尝试登录流程: ${JSON.stringify(lastState || {})}`);
+  return ws;
 }
 
 /**
@@ -420,6 +543,7 @@ async function clickTextByCdp(ws: WebSocket, pattern: string, flags = 'i', conte
       const role = el.getAttribute('role') || '';
       const txt = textOf(el);
       return (el.matches('button,a,[role=button],[role=menuitem]') ? 120 : 0)
+        + (/^sign in to claim$/i.test(txt) ? 300 : 0)
         + (/lv_new_third_part_sign_in_expand-button|login-button/i.test(cls) ? 220 : 0)
         + (/lv_new_third_part_sign_in_expand-wrapper/i.test(cls) ? 80 : 0)
         + (/email|mail|電子郵件|电子邮件|郵箱|邮箱|login|sign/i.test(cls + ' ' + txt) ? 80 : 0)
@@ -448,7 +572,6 @@ async function clickTextByCdp(ws: WebSocket, pattern: string, flags = 'i', conte
     if (!el) return null;
     // 先滚动，坐标在下一次调用里再取，避免平滑滚动未结束导致坐标失效。
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-    window.__jmClickTarget = el;
     const r = el.getBoundingClientRect();
     // Input.dispatchMouseEvent 使用顶层 viewport 坐标；若元素位于 iframe 中，
     // getBoundingClientRect 返回的是 iframe 内部坐标，必须叠加各层 iframe 的偏移。
@@ -485,23 +608,25 @@ async function clickTextByCdp(ws: WebSocket, pattern: string, flags = 'i', conte
   await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: target.x, y: target.y, button: 'left', clickCount: 1 }, 5000);
   await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: target.x, y: target.y, button: 'left', clickCount: 1 }, 5000);
 
-  // 真实鼠标点击可能被遮罩层拦截；补一次目标元素上的直接 DOM click 作为兜底。
-  await evalOnPage(ws, `(() => {
-    const el = window.__jmClickTarget;
-    if (!el || !el.isConnected) return false;
-    const r = el.getBoundingClientRect();
-    const o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    el.dispatchEvent(new MouseEvent('mousedown', o));
-    el.dispatchEvent(new MouseEvent('mouseup', o));
-    el.dispatchEvent(new MouseEvent('click', o));
-    delete window.__jmClickTarget;
-    return true;
-  })()`, 10000, contextId).catch(() => false);
+  // Dispatch one trusted click. A second synthetic click can run after React
+  // has opened the next dialog and reset the flow back to method selection.
   return true;
 }
 
 
 const PASS_INPUT_FN = `i => i.type === 'password' || /password|passwd|pwd|密码|密碼|mật khẩu|mat khau/i.test([i.name,i.id,i.placeholder,i.autocomplete].join(' '))`;
+
+type DreaminaLoginField = { type?: string; name?: string; id?: string; placeholder?: string; autocomplete?: string };
+
+export function classifyDreaminaCredentialFields(fields: DreaminaLoginField[]): { userIndex: number; passwordIndex: number } {
+  const value = (field: DreaminaLoginField) => [field.type, field.name, field.id, field.placeholder, field.autocomplete].join(' ');
+  const passwordIndex = fields.findIndex(field => field.type === 'password'
+    || /password|passwd|pwd|密码|密碼|mật khẩu|mat khau/i.test(value(field)));
+  const userPattern = /email|e-mail|mail|user|account|phone|mobile|login|correo|メール|이메일|邮箱|郵箱|電郵|账号|帳號|tài khoản|tai khoan/i;
+  const userIndex = fields.findIndex((field, index) => index !== passwordIndex
+    && (field.type === 'email' || field.type === 'tel' || userPattern.test(value(field))));
+  return { userIndex, passwordIndex };
+}
 
 /**
  * 邮箱框只在同一表单/弹窗里存在密码框时才认定，避免匹配到首页的搜索框或提示词框。
@@ -514,13 +639,15 @@ const PASS_INPUT_FN = `i => i.type === 'password' || /password|passwd|pwd|密码
  */
 const CREDENTIAL_FIELDS_EXPR = `(() => {
   const visible = ${VISIBLE_FN};
-  const isPass = ${PASS_INPUT_FN};
+  const classify = (${classifyDreaminaCredentialFields.toString()});
   const inputs = [...document.querySelectorAll('input')].filter(visible);
-  if (inputs.find(isPass)) return true;
   const LOGIN_SCOPE_SEL = 'form,[role=dialog],[class*=modal],[class*=login],[class*=sign],[class*=Login],[class*=Sign]';
-  return inputs.some(i => {
-    if (i.type !== 'email' && !/email|e-mail|邮箱|郵箱/i.test([i.name,i.id,i.placeholder,i.autocomplete].join(' '))) return false;
-    return !!i.closest(LOGIN_SCOPE_SEL);
+  const scoped = inputs.filter(i => i.closest(LOGIN_SCOPE_SEL));
+  return scoped.some(input => {
+    const scope = input.closest(LOGIN_SCOPE_SEL);
+    const pool = scoped.filter(candidate => candidate.closest(LOGIN_SCOPE_SEL) === scope);
+    const result = classify(pool.map(i => ({ type:i.type, name:i.name, id:i.id, placeholder:i.placeholder, autocomplete:i.autocomplete })));
+    return result.userIndex >= 0 || result.passwordIndex >= 0;
   });
 })()`;
 
@@ -565,29 +692,97 @@ async function handleDreaminaPostSubmitRecovery(ws: WebSocket): Promise<boolean>
 }
 
 export async function checkDreaminaLoginByCdp(cdpPort: number, cdpWsUrl?: string | null): Promise<DreaminaLoginResult> {
-  const wsUrl = cdpWsUrl || await waitForPageWs(cdpPort, 15000);
+  // Dreamina replaces the page target during navigation/login. Rediscover it
+  // first so a persisted URL does not point at a closed target or old port.
+  let wsUrl = '';
+  try {
+    const tabs = await getCdpTargets(cdpPort, 5000);
+    const pages = tabs.filter(t => t.type === 'page' && t.webSocketDebuggerUrl);
+    // The auth flow can briefly move from Dreamina to a CapCut identity page.
+    // Prefer those known first-party pages before falling back to any usable
+    // non-blank tab; otherwise a stale saved websocket can make check-login
+    // report a false failure after a successful redirect.
+    // A QR flow opens a second Dreamina target. Prefer it while the user is
+    // still completing the scan so the checker reports the actionable state
+    // instead of looking at the stale home tab.
+    const page = pages.find(t => /\/scan-qr-code(?:[/?]|$)/i.test(String(t.url || '')))
+      || pages.find(t => String(t.url || '').includes('dreamina.capcut.com'))
+      || pages.find(t => /(?:^|[/:.])capcut\.com(?:\/|$)/i.test(String(t.url || '')))
+      || pages.find(t => !/^(?:about:blank|chrome|devtools):/i.test(String(t.url || '')))
+      || (!cdpWsUrl ? pages[0] : undefined);
+    if (page?.webSocketDebuggerUrl) wsUrl = rewriteCdpWsUrl(page.webSocketDebuggerUrl, cdpPort);
+  } catch (e: any) {
+    logger.debug('Dreamina 登录检测重新发现页面失败，将回退已保存 CDP: ' + (e?.message || e));
+  }
+  if (!wsUrl && cdpWsUrl) {
+    try { wsUrl = rewriteCdpWsUrl(cdpWsUrl, cdpPort); } catch { wsUrl = cdpWsUrl; }
+  }
+  if (!wsUrl) wsUrl = await waitForPageWs(cdpPort, 15000);
   const ws = new WebSocket(wsUrl);
   return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { try { ws.close(); } catch {}; reject(new Error("check login timeout")); }, 30000);
+    let settled = false;
+    const finish = (error?: Error, result?: DreaminaLoginResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Detach handlers before closing so cleanup's close event cannot settle
+      // the promise a second time.
+      ws.onopen = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try { ws.close(); } catch {}
+      if (error) reject(error);
+      else resolve(result as DreaminaLoginResult);
+    };
+    const timer = setTimeout(() => finish(new Error("check login timeout")), 30000);
     ws.onopen = async () => {
       try {
+        if (settled) return;
         const parsed = await getPageSnapshot(ws, 3000);
-        const cookies = await cdpCall(ws, "Network.getAllCookies").catch(() => ({ cookies: [] }));
-        const cookieHeader = cookieHeaderFromCdp(cookies.cookies || []);
-        const text = String(parsed.text || "").toLowerCase();
-        const docCookie = String(parsed.cookies || "");
-        const loggedIn = /sessionid=|sid_tt=|sid_guard=/.test(cookieHeader || docCookie);
-        const need2fa = /(verify|verification|code|captcha|验证码|安全验证|two-factor|2fa)/i.test(parsed.text || "");
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        resolve({ status: loggedIn ? "ok" : need2fa ? "need_2fa" : "failed", cookies: cookieHeader || docCookie, cdpPort, cdpWsUrl: wsUrl, userAgent: parsed.ua });
+        await cdpCall(ws, "Network.enable", {}, 10000).catch(() => null);
+        const cookies = await cdpCall(ws, "Network.getAllCookies", {}, 15000).catch(() => null);
+        const cookieHeader = cookieHeaderFromCdp(cookies?.cookies || []);
+        let docCookie = '';
+        // document.cookie has no domain/expiry metadata. Use it only on a
+        // first-party page, and only as a fallback when the CDP cookie jar is
+        // unavailable or unexpectedly empty (some remote CDP proxies return
+        // `{ cookies: [] }` for an otherwise valid page).
+        if (!cookies || !Array.isArray(cookies.cookies) || cookies.cookies.length === 0) {
+          try {
+            if (isCapcutDomain(new URL(parsed.url).hostname)) docCookie = String(parsed.cookies || '');
+          } catch {}
+        }
+        const authCookieNames = new Set(['sessionid', 'sessionid_ss', 'sid_tt', 'sid_guard']);
+        const hasAuthCookie = (name: any, value: any) => authCookieNames.has(String(name || '').toLowerCase()) && String(value ?? '').trim() !== '';
+        const loggedIn = (cookieHeader || docCookie).split(';').some(part => {
+            const [name, ...rest] = String(part).trim().split('=');
+            return hasAuthCookie(name, rest.join('='));
+          });
+        const pageUrl = String(parsed.url || '');
+        const pageText = String(parsed.text || '');
+        const qrLogin = /(?:scan[-_ ]?qr|qr[-_ ]?code|capcut mobile|扫描二维码|掃描二維碼|扫码|掃碼)/i.test(`${pageUrl} ${pageText}`);
+        const verification = /(verify|verification|verification code|security code|one[- ]time password|otp|captcha|验证码|安全验证|二次验证|兩步驗證|驗證碼|認証コード|確認コード|인증 코드|인증번호)/i.test(pageText);
+        const methodChooser = /continue with (google|apple|facebook|tiktok|capcut mobile)|continue.*(?:email|e-mail|mail)|使用.*(?:Google|Apple|Facebook|TikTok|电子邮件|邮箱|電郵)|繼續.*(?:Google|Apple|Facebook|TikTok|電子郵件|電郵)|继续.*(?:Google|Apple|Facebook|TikTok|电子邮件|邮箱)|登录方式|登入方式|登录 Dreamina|登入 Dreamina/i.test(pageText);
+        const status = loggedIn ? "ok" : (qrLogin || verification) ? "need_2fa" : "failed";
+        const message = loggedIn ? undefined
+          : qrLogin ? '当前为二维码登录，请在 BitBrowser 中使用 CapCut App 扫码后点击“继续检测”'
+          : verification ? '检测到验证码或二次验证，请在 BitBrowser 中完成后点击“继续检测”'
+          : methodChooser ? '当前仍停留在登录方式选择页，请选择邮箱、第三方账号或二维码方式完成登录'
+          : undefined;
+        finish(undefined, {
+          status,
+          message,
+          cookies: cookieHeader || docCookie,
+          cdpPort,
+          cdpWsUrl: wsUrl,
+          userAgent: parsed.ua
+        });
       } catch (e) {
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        reject(e);
+        finish(e instanceof Error ? e : new Error(String(e)));
       }
     };
-    ws.onerror = () => { clearTimeout(timer); reject(new Error("CDP websocket error")); };
+    ws.onerror = () => finish(new Error("CDP websocket error"));
+    ws.onclose = () => finish(new Error("CDP connection closed"));
   });
 }
 
@@ -596,39 +791,126 @@ export async function loginDreaminaViaBitBrowser(options: {
   username?: string;
   password?: string;
   loginUrl?: string;
+  onOpened?: (runtime: { cdpPort: number; cdpWsUrl?: string; userAgent?: string }) => void | Promise<void>;
+  onProgress?: (message: string) => void | Promise<void>;
 }): Promise<DreaminaLoginResult> {
   const client = new BitBrowserClient();
+  let automationTimedOut = false;
+  let automationSettled = false;
+  const automationActive = () => !automationTimedOut && !automationSettled;
+  const reportProgress = async (message: string) => {
+    if (!automationActive()) return;
+    try { await options.onProgress?.(message); }
+    catch (e: any) { logger.warn(`Dreamina 登录进度回调失败: ${e?.message || e}`); }
+  };
   logger.info(`打开 BitBrowser profile: ${options.bitbrowserProfileId}`);
+  await reportProgress('正在打开 BitBrowser');
   const opened = await client.open(options.bitbrowserProfileId);
   if (!opened.cdpPort) throw new Error("BitBrowser open did not return CDP port");
 
-  const wsUrl = opened.ws || await waitForPageWs(opened.cdpPort, 60000).catch(() => "");
-  const pageWsUrl = wsUrl.includes("/devtools/page/") ? wsUrl : undefined;
-  const targetWs = pageWsUrl || await waitForPageWs(opened.cdpPort, 60000);
-  const ws = new WebSocket(targetWs);
+  const openedWs = opened.ws && opened.ws.includes('/devtools/page/')
+    ? rewriteCdpWsUrl(opened.ws, opened.cdpPort)
+    : undefined;
+  try {
+    await options.onOpened?.({ cdpPort: opened.cdpPort, cdpWsUrl: openedWs, userAgent: undefined });
+  } catch (e: any) {
+    logger.warn(`Dreamina 登录打开回调失败: ${e?.message || e}`);
+  }
+  await reportProgress('正在连接 CDP');
+  let targetWs = '';
+  try {
+    targetWs = await waitForAnyPageWs(opened.cdpPort, 60000);
+  } catch (e: any) {
+    if (!openedWs) throw e;
+    logger.warn(`CDP 页面重新发现失败，回退 /browser/open 返回的页面: ${e?.message || e}`);
+    targetWs = openedWs;
+  }
+  try {
+    await options.onOpened?.({ cdpPort: opened.cdpPort, cdpWsUrl: targetWs, userAgent: undefined });
+  } catch (e: any) {
+    logger.warn(`Dreamina 登录页面回调失败: ${e?.message || e}`);
+  }
+  let ws = new WebSocket(targetWs);
+  const refreshPage = async (): Promise<WebSocket> => {
+    if (!automationActive()) throw new Error('Dreamina login automation is no longer active');
+    const currentTarget = await waitForAnyPageWs(opened.cdpPort!, 15000);
+    if (!automationActive()) throw new Error('Dreamina login automation is no longer active');
+    if (currentTarget === targetWs && ws.readyState === WebSocket.OPEN) return ws;
+    const previous = ws;
+    const replacement = await connectPageWebSocket(currentTarget);
+    if (!automationActive()) {
+      try { replacement.close(); } catch {}
+      throw new Error('Dreamina login automation is no longer active');
+    }
+    previous.on('error', () => {});
+    previous.onerror = null;
+    previous.onclose = null;
+    ws = replacement;
+    targetWs = currentTarget;
+    ws.onclose = () => automationFinish?.(new Error('CDP connection closed'));
+    ws.onerror = () => automationFinish?.(new Error('CDP websocket error'));
+    try { previous.close(); } catch {}
+    try {
+      await options.onOpened?.({ cdpPort: opened.cdpPort!, cdpWsUrl: targetWs });
+    } catch (e: any) { logger.warn(`Dreamina 登录页面回调失败: ${e?.message || e}`); }
+    return ws;
+  };
   // 自动填表的诊断结果需要在 Promise 之外可见，以便写入登录状态提示。
   let fillOutcome: any = null;
+  let automationFinish: ((error?: Error) => void) | null = null;
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { try { ws.close(); } catch {}; reject(new Error("Dreamina login automation timeout")); }, 120000);
+  const automationResult = await new Promise<DreaminaLoginResult>((resolve, reject) => {
+    const finish = (error?: Error, result?: DreaminaLoginResult) => {
+      if (automationSettled) return;
+      automationSettled = true;
+      clearTimeout(timer);
+      ws.onopen = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try { ws.close(); } catch {}
+      if (error) reject(error);
+      else resolve(result as DreaminaLoginResult);
+    };
+    automationFinish = finish;
+    const timer = setTimeout(() => {
+      automationTimedOut = true;
+      finish(new Error("Dreamina login automation timeout"));
+    }, 120000);
     ws.onopen = async () => {
       try {
-        await navigateAndWait(ws, options.loginUrl || DEFAULT_LOGIN_URL);
+        if (!automationActive()) return;
+        await reportProgress('正在打开 Dreamina');
+        ws = await navigateAndWait(ws, getDreaminaLoginUrl(options.loginUrl), refreshPage);
+        if (!automationActive()) return;
 
+        await reportProgress('正在检测登录状态');
         const before = await checkDreaminaLoginByCdp(opened.cdpPort!, targetWs).catch(() => null);
+        if (!automationActive()) return;
         if (before?.status === "ok") {
-          clearTimeout(timer);
-          try { ws.close(); } catch {}
-          return resolve();
+          // Keep the already-confirmed session result intact.  Resolving the
+          // detached promise without a value makes the dashboard route read
+          // `result.cdpPort` from undefined and mark a perfectly valid
+          // existing session as failed.
+          return finish(undefined, {
+            status: 'ok',
+            message: before.message,
+            cookies: before.cookies,
+            cdpPort: before.cdpPort || opened.cdpPort,
+            cdpWsUrl: before.cdpWsUrl || targetWs,
+            userAgent: before.userAgent,
+          } as any);
         }
 
         if (options.username && options.password) {
+          if (!automationActive()) return;
+          await refreshPage();
+          await reportProgress('正在填写登录表单');
           logger.info(`尝试自动填写 Dreamina 登录表单: ${mask(options.username)}`);
           // Prefer real CDP mouse clicks for the login dialog. Dreamina often ignores
           // synthetic DOM click events on these login controls. If the credential
           // form is already visible, do not click the login-method chooser again;
           // doing so can reset the modal back to the method selection page.
-          const EMAIL_OPTION_RE = '使用.*(電子郵件|电子邮件|電郵|郵箱|邮箱).*繼續|使用.*(電子郵件|电子邮件|電郵|郵箱|邮箱).*继续|continue.*(email|e-mail)|email.*continue|tiếp tục bằng email|tiep tuc bang email|電子郵件|电子邮件|邮箱|郵箱';
+          const EMAIL_OPTION_RE = 'continue.*(email|e-mail|mail|電子郵件|电子邮件|電郵|邮箱|郵箱|メール|이메일|correo)|email.*continue|use.*(email|e-mail|mail)|使用.*(電子郵件|电子邮件|電郵|邮箱|郵箱)|繼續.*(電子郵件|电邮|邮箱|郵箱)|继续.*(电子邮件|邮箱)|tiếp tục bằng email|tiep tuc bang email|email|e-mail|電子郵件|电子邮件|電郵|邮箱|郵箱|メール|이메일|correo';
 
           // 登录弹窗可能在 iframe 内：先在所有 execution context 里找凭据表单。
           let credCtx = await findCredentialContextId(ws).catch(() => undefined);
@@ -639,6 +921,7 @@ export async function loginDreaminaViaBitBrowser(options: {
             // 登录方式选择按钮同样可能在 iframe 内，逐个 context 尝试点击。
             const clickInAnyContext = async (pattern: string): Promise<boolean> => {
               for (const ctx of await collectExecutionContexts(ws)) {
+                if (!automationActive()) return false;
                 if (await clickTextByCdp(ws, pattern, 'i', ctx).catch(() => false)) return true;
               }
               return false;
@@ -647,8 +930,16 @@ export async function loginDreaminaViaBitBrowser(options: {
             // 分阶段推进，每步验证是否已出现凭据表单，避免在首页空点或重复点击重置弹窗。
             // 阶段一：页面可能仍是未登录首页（日志实测文本为 "Sign in to start creating"），
             // 需要先打开登录弹窗；?need_login=true 并不保证弹窗自动弹出。
-            const SIGN_IN_RE = '^\\s*(sign in|sign up|log in|login|登录|登入|登錄|đăng nhập|dang nhap)\\s*$';
-            for (const stage of [SIGN_IN_RE, EMAIL_OPTION_RE] as const) {
+            // The unauthenticated Dreamina home uses a CTA such as
+            // "Sign in to start creating" rather than a bare "Sign in".
+            // Keep the match anchored so we do not click unrelated copy, but
+            // allow the CTA suffix (and its localized equivalents) to open
+            // the login dialog before looking for the email method.
+            const SIGN_IN_RE = '^\\s*(sign in|sign up|log in|login|登录|登入|登錄|đăng nhập|dang nhap|iniciar sesión|se connecter|connexion|ログイン|로그인|masuk|เข้าสู่ระบบ)(?:\\s+(?:to\\s+(?:start\\s+creating|create|claim|continue)|now))?\\s*$';
+            const CLAIM_SIGN_IN_RE = '^\\s*sign in to claim\\s*$';
+            for (const stage of [SIGN_IN_RE, CLAIM_SIGN_IN_RE, EMAIL_OPTION_RE] as const) {
+              if (!automationActive()) return;
+              await refreshPage();
               credCtx = await findCredentialContextId(ws).catch(() => undefined);
               if (credCtx !== undefined) break;
               const clicked = await clickInAnyContext(stage);
@@ -713,19 +1004,27 @@ export async function loginDreaminaViaBitBrowser(options: {
     el.dispatchEvent(new Event('change',{bubbles:true}));
     return true;
   };
+  const classify = (${classifyDreaminaCredentialFields.toString()});
   const isPass = ${PASS_INPUT_FN};
-  const findPass = () => [...document.querySelectorAll('input')].filter(visible).find(isPass);
-  const USER_RE = /email|e-mail|user|account|phone|mobile|login|mail|邮箱|郵箱|账号|帳號|tài khoản|tai khoan/i;
   // 账号框必须落在登录弹窗/表单范围内，避免误取首页提示词框（实测 hasUser 曾在首页误判为 true）。
   const LOGIN_SCOPE_SEL = 'form,[role=dialog],[class*=modal],[class*=login],[class*=sign],[class*=Login],[class*=Sign]';
-  const findUser = () => {
+  const findCredentialFields = () => {
     const inputs = [...document.querySelectorAll('input')].filter(visible);
-    const pass = inputs.find(isPass);
-    const scope = (pass || inputs.find(i => i.type === 'email'))?.closest(LOGIN_SCOPE_SEL);
-    const pool = scope ? inputs.filter(i => scope.contains(i)) : inputs;
-    return pool.find(i => i !== pass && (i.type === 'email' || (i.type === 'text' && USER_RE.test([i.name,i.id,i.placeholder,i.autocomplete].join(' ')))));
+    const scoped = inputs.filter(i => i.closest(LOGIN_SCOPE_SEL));
+    const anchor = scoped.find(i => isPass(i) || i.type === 'email' || i.type === 'tel'
+      || /email|e-mail|mail|user|account|phone|mobile|login|correo|メール|이메일|邮箱|郵箱|電郵|账号|帳號|tài khoản|tai khoan/i.test([i.name,i.id,i.placeholder,i.autocomplete].join(' ')));
+    const scope = anchor?.closest(LOGIN_SCOPE_SEL);
+    if (!scope) return { user: null, pass: null };
+    const pool = scoped.filter(i => i.closest(LOGIN_SCOPE_SEL) === scope);
+    const result = classify(pool.map(i => ({ type:i.type, name:i.name, id:i.id, placeholder:i.placeholder, autocomplete:i.autocomplete })));
+    return {
+      user: result.userIndex >= 0 ? pool[result.userIndex] : null,
+      pass: result.passwordIndex >= 0 ? pool[result.passwordIndex] : null,
+    };
   };
-  const submitRe = /^(log in|sign in|login|continue|next|submit|登录|登入|繼續|继续|下一步|tiếp tục|tiep tuc|kế tiếp|ke tiep|đăng nhập|dang nhap)$/i;
+  const findPass = () => findCredentialFields().pass;
+  const findUser = () => findCredentialFields().user;
+  const submitRe = /^(log in|sign in|login|continue|next|submit|proceed|verify|send code|get code|登录|登入|登錄|繼續|继续|下一步|tiếp tục|tiep tuc|kế tiếp|ke tiep|đăng nhập|dang nhap|continuar|siguiente|iniciar sesión|se connecter|continuer|進む|続行|次へ|ログイン|계속|다음|로그인|lanjutkan|masuk|ดำเนินการต่อ|เข้าสู่ระบบ|entrar|iniciar sessão)$/i;
   // 从输入框向上逐层查找最近的提交按钮，绝不退化为全文档搜索。
   // 全文档搜索会命中页面右上角的全局 "Sign in"（DOM 顺序早于弹窗），
   // 点击它等于重新打开登录弹窗，导致流程退回登录方式选择页。
@@ -750,7 +1049,7 @@ export async function loginDreaminaViaBitBrowser(options: {
   let pass = findPass();
 
   if (!user && !pass) {
-    const emailOption = byText(/continue.*(email|e-mail)|email.*continue|tiếp tục bằng email|tiep tuc bang email|使用.*(電子郵件|电子邮件|電郵|郵箱|邮箱).*繼續|使用.*(電子郵件|电子邮件|電郵|郵箱|邮箱).*继续|電子郵件|电子邮件|邮箱|郵箱/i);
+    const emailOption = byText(/continue.*(email|e-mail|mail|電子郵件|电子邮件|電郵|邮箱|郵箱|メール|이메일|correo)|email.*continue|use.*(email|e-mail|mail)|tiếp tục bằng email|tiep tuc bang email|繼續.*(電子郵件|电邮|邮箱|郵箱)|继续.*(电子邮件|邮箱)|使用.*(電子郵件|电子邮件|電郵|郵箱|邮箱)|^\s*(email|e-mail|電子郵件|电子邮件|電郵|邮箱|郵箱|メール|이메일)\s*$/i);
     if (emailOption) { clickLike(emailOption); trace.push('clicked-email-option'); await sleep(3000); }
     user = findUser();
     pass = findPass();
@@ -839,21 +1138,31 @@ export async function loginDreaminaViaBitBrowser(options: {
             // open so the user can finish captcha/2FA/manual login and then click 检测.
             logger.warn(`Dreamina 自动填表未确认完成: ${e.message || e}`);
           }
+          if (!automationActive()) return;
+          await reportProgress('等待验证码或二次验证');
           await new Promise(r => setTimeout(r, Number(process.env.DREAMINA_LOGIN_SETTLE_MS || 30000)));
+          if (!automationActive()) return;
+          await reportProgress('正在保存登录状态');
+          await refreshPage();
+          if (!automationActive()) return;
           await handleDreaminaPostSubmitRecovery(ws).catch(e => logger.warn(`Dreamina 登录恢复处理失败: ${e.message || e}`));
         }
 
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        resolve();
+        // This only means the browser automation phase completed. The caller
+        // performs a fresh cookie check below before declaring the login valid.
+        finish(undefined, { status: 'failed', message: '' });
       } catch (e) {
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        reject(e);
+        if (automationActive()) finish(e instanceof Error ? e : new Error(String(e)));
       }
     };
-    ws.onerror = () => { clearTimeout(timer); reject(new Error("CDP websocket error")); };
+    ws.onerror = () => finish(new Error("CDP websocket error"));
+    ws.onclose = () => finish(new Error("CDP connection closed"));
   });
+
+  // An already authenticated profile is verified by the preflight check and
+  // carries its cookie snapshot. Return it directly so a second target scan
+  // cannot accidentally inspect an old/blank tab and overwrite success.
+  if (automationResult.status === 'ok' && automationResult.cookies) return automationResult;
 
   // The login click may navigate or replace the page target; rediscover the current
   // Dreamina page instead of reusing a possibly stale WebSocket URL.

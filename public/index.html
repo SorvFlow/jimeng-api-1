@@ -102,6 +102,20 @@
       .muted { color: var(--text-secondary); font-size: 12px; }
       .mono-small { font-family: "Monaco","Consolas",monospace; font-size: 12px; color: #93c5fd; }
       .account-sub { margin-top: 4px; color: var(--text-secondary); font-size: 12px; }
+      .account-login-error { max-width: 280px; overflow-wrap: anywhere; white-space: normal; line-height: 1.4; }
+      .login-progress { margin-top: 8px; min-width: 240px; max-width: 360px; padding: 9px 10px; background: rgba(26,26,46,0.72); border: 1px solid var(--border); border-radius: 8px; }
+      .login-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+      .login-progress-stage { color: var(--text-primary); font-weight: 600; }
+      .login-progress-percent { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+      .login-progress-track { height: 5px; margin: 7px 0 6px; overflow: hidden; background: rgba(161,161,170,0.18); border-radius: 999px; }
+      .login-progress-bar { height: 100%; min-width: 2px; background: linear-gradient(90deg, var(--accent), #ec4899); border-radius: inherit; transition: width 0.25s ease; }
+      .login-progress-message, .login-progress-blocker, .login-progress-updated { max-width: 340px; overflow-wrap: anywhere; white-space: normal; line-height: 1.35; }
+      .login-progress-blocker { color: var(--warning); }
+      .login-progress-actions { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+      .login-progress-actions .btn-sm { padding: 5px 8px; font-size: 11px; }
+      .login-progress.is-error { border-color: rgba(239,68,68,0.45); }
+      .login-progress.is-success { border-color: rgba(16,185,129,0.45); }
+      @media (max-width: 900px) { .login-progress { min-width: 180px; max-width: 280px; } }
       .btn-warning { background: var(--warning); color: #111827; }
       .btn-warning:hover { background: #fbbf24; }
       .wide-modal { max-width: 760px; }
@@ -447,12 +461,17 @@ user3@example.com,password3"></textarea></div>
       let loadedLogs = [];
       const API_BASE = location.origin;
       const pendingActions = new Set();
+      const ACCOUNTS_REFRESH_MS = 5000;
+      const ACCOUNTS_REQUEST_TIMEOUT_MS = 15000;
+      let accountsLoadInFlight = null;
+      let accountsRefreshTimer = null;
+      let accountsRefreshRequested = false;
+      let accountsSnapshot = new Map();
 
       // ===== 通用工具 =====
       function escapeHtml(str) {
-        const div = document.createElement("div");
-        div.textContent = str == null ? "" : String(str);
-        return div.innerHTML;
+        const value = str == null ? "" : String(str);
+        return value.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
       }
       function toast(msg, type = "success") {
         const el = document.getElementById("toast");
@@ -654,11 +673,92 @@ user3@example.com,password3"></textarea></div>
       const REGION_NAMES = { cn: "国内", us: "美区", hk: "港区", jp: "日区", sg: "新区", vn: "越南" };
       const STATUS_NAMES = { active: "正常", error: "异常", unknown: "未检测", disabled: "禁用", expired: "已失效" };
       const LOGIN_STATUS_NAMES = { pending: "待登录", logging_in: "登录中", ok: "已登录", failed: "登录失败", need_2fa: "需验证", unknown: "未检测" };
+      const LOGIN_STAGE_NAMES = {
+        pending: "待启动", resolving_profile: "匹配 BitBrowser", opening_profile: "打开 BitBrowser",
+        connecting_cdp: "连接 CDP", navigating: "打开 Dreamina", checking_session: "检查已有登录态",
+        filling_form: "填写登录表单", waiting_verification: "等待验证码/二次验证", waiting_login: "等待登录完成",
+        checking_login: "最终检测", success: "已登录", failed: "登录失败",
+        // Backend progress updates use these stable stage keys while older
+        // records may contain the newer UI-oriented aliases above.
+        starting: "启动登录任务", opening_browser: "打开 BitBrowser", loading_page: "加载 Dreamina 页面",
+        filling_credentials: "填写登录凭据", processing: "处理中", completed: "已登录", idle: "待启动",
+      };
+      function loginStageName(stage, status) {
+        const key = String(stage || status || "unknown");
+        if (LOGIN_STAGE_NAMES[key]) return LOGIN_STAGE_NAMES[key];
+        return key.replace(/[_-]+/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase()) || "登录处理中";
+      }
+      function accountLoginProgress(account) {
+        const status = account.login_status || "unknown";
+        const rawPercent = Number(account.login_progress_percent);
+        const hasPercent = Number.isFinite(rawPercent) && rawPercent >= 0 && rawPercent <= 100;
+        const percent = hasPercent ? Math.round(rawPercent) : ({ pending: 0, logging_in: 35, need_2fa: 70, ok: 100, failed: 100 }[status] ?? 0);
+        const action = account.login_progress_message || account.last_login_error || (status === "logging_in" ? "正在处理登录流程" : LOGIN_STATUS_NAMES[status] || "等待操作");
+        const blocker = account.login_progress_blocker || (status === "need_2fa" ? "请在 BitBrowser 中完成验证码或二次验证" : (status === "failed" ? (account.last_login_error || "登录流程失败") : ""));
+        const updated = account.login_progress_updated_at || account.last_login_at || "";
+        const stage = loginStageName(account.login_progress_stage, status);
+        return { status, percent, action, blocker, updated, stage };
+      }
+      function formatLoginUpdatedAt(value) {
+        if (!value) return "暂无时间";
+        const date = new Date(String(value).replace(" ", "T"));
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+      }
+      function copyAccountLoginDiagnostics(id) {
+        const account = accountsSnapshot.get(Number(id));
+        if (!account) { toast("账号信息尚未加载", "error"); return; }
+        const progress = accountLoginProgress(account);
+        const lines = [
+          `账号 ID: ${account.id}`, `账号名称: ${account.name || ""}`, `区域: ${account.region || ""}`,
+          `登录状态: ${LOGIN_STATUS_NAMES[progress.status] || progress.status}`, `登录阶段: ${progress.stage}`,
+          `进度: ${progress.percent}%`, `当前动作: ${progress.action}`, `卡点: ${progress.blocker || "无"}`,
+          `最近更新: ${formatLoginUpdatedAt(progress.updated)}`, `BitBrowser Profile: ${account.bitbrowser_profile_id || "未绑定"}`,
+          `CDP 端口: ${account.cdp_port || "未知"}`,
+        ];
+        copyText(lines.join("\n"));
+      }
+      function renderLoginProgress(account) {
+        const progress = accountLoginProgress(account);
+        const stateClass = progress.status === "failed" ? "is-error" : progress.status === "ok" ? "is-success" : "";
+        const actionButtons = progress.status === "logging_in" || progress.status === "need_2fa"
+          ? `<button class="btn btn-sm btn-warning" title="重新读取当前浏览器的登录态" onclick="checkBitBrowserLogin(${account.id})">继续检测</button>`
+          : `<button class="btn btn-sm" title="重新启动 Dreamina 登录流程" onclick="loginBitBrowser(${account.id})">重新登录</button>`;
+        return `<div class="login-progress ${stateClass}" data-account-id="${account.id}">
+          <div class="login-progress-head"><span class="login-progress-stage">阶段：${escapeHtml(progress.stage)}</span><span class="login-progress-percent">${progress.percent}%</span></div>
+          <div class="login-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent}" aria-label="Dreamina 登录进度"><div class="login-progress-bar" style="width:${progress.percent}%"></div></div>
+          <div class="login-progress-message">当前动作：${escapeHtml(progress.action)}</div>
+          ${progress.blocker ? `<div class="login-progress-blocker">卡点：${escapeHtml(progress.blocker)}</div>` : ""}
+          <div class="login-progress-updated muted">最近更新：${escapeHtml(formatLoginUpdatedAt(progress.updated))}</div>
+          <div class="login-progress-actions">${actionButtons}<button class="btn btn-sm btn-ghost" title="打开当前账号的 BitBrowser 页面" onclick="openBitBrowser(${account.id})">打开页面</button><button class="btn btn-sm btn-ghost" title="复制脱敏诊断信息" onclick="copyAccountLoginDiagnostics(${account.id})">复制诊断</button></div>
+        </div>`;
+      }
+      function scheduleAccountsRefresh(delay = ACCOUNTS_REFRESH_MS) {
+        if (accountsRefreshTimer) clearTimeout(accountsRefreshTimer);
+        accountsRefreshTimer = setTimeout(() => {
+          accountsRefreshTimer = null;
+          loadAccounts();
+        }, delay);
+      }
       async function loadAccounts() {
-        try {
-          const res = await api("/dashboard/accounts");
-          if (!res.ok) return;
+        if (accountsLoadInFlight) {
+          accountsRefreshRequested = true;
+          return accountsLoadInFlight;
+        }
+        // Keep polling through transient failures while the last known
+        // snapshot still contains a running login task.
+        let hasLoggingIn = [...accountsSnapshot.values()].some((a) => a.login_status === "logging_in");
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ACCOUNTS_REQUEST_TIMEOUT_MS);
+        accountsLoadInFlight = (async () => {
+          try {
+          const res = await api("/dashboard/accounts", { signal: controller.signal });
+          if (!res.ok) {
+            if (res.status === 401 || res.status === 403) hasLoggingIn = false;
+            return;
+          }
           const list = await res.json();
+          accountsSnapshot = new Map(list.map((account) => [Number(account.id), account]));
+          hasLoggingIn = list.some((a) => a.login_status === "logging_in");
           const tbody = document.getElementById("accounts-table");
           if (!list.length) {
             tbody.innerHTML = '<tr><td colspan="8" class="loading">暂无账号，点击右上角添加</td></tr>';
@@ -683,24 +783,37 @@ user3@example.com,password3"></textarea></div>
               <td>
                 <div><span class="badge ${st}">${STATUS_NAMES[st] || st}</span></div>
                 <div style="margin-top:6px"><span class="badge ${loginBadgeClass}">${LOGIN_STATUS_NAMES[loginSt] || loginSt}</span></div>
-                ${a.last_login_error ? `<div class="account-sub" title="${escapeHtml(a.last_login_error)}">${escapeHtml(a.last_login_error).slice(0, 24)}</div>` : ''}
+                ${a.last_login_error ? `<div class="account-sub account-login-error" title="${escapeHtml(a.last_login_error)}">${escapeHtml(a.last_login_error)}</div>` : ''}
               </td>
-              <td class="row-actions">
-                <button class="btn btn-sm" onclick="loginBitBrowser(${a.id})">登录/修复</button>
-                <button class="btn btn-sm btn-warning" onclick="checkBitBrowserLogin(${a.id})">检测</button>
-                <button class="btn btn-sm btn-ghost" onclick="checkAccount(${a.id})">查积分</button>
-                <details class="advanced-actions">
-                  <summary class="btn btn-sm btn-ghost">高级</summary>
-                  <div class="advanced-menu">
-                    <button class="btn btn-sm btn-ghost" onclick="showBindProfileModal(${a.id}, '${escapeHtml(a.bitbrowser_profile_id || '')}')">绑定 Profile</button>
-                    <button class="btn btn-sm btn-ghost" onclick="openBitBrowser(${a.id})">仅打开窗口</button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteAccount(${a.id})">删除账号</button>
-                  </div>
-                </details>
+              <td>
+                ${renderLoginProgress(a)}
+                <div class="row-actions" style="margin-top:8px">
+                  ${loginSt === "logging_in" ? '<button class="btn btn-sm" disabled>登录中</button>' : `<button class="btn btn-sm" onclick="loginBitBrowser(${a.id})">登录/修复</button>`}
+                  <button class="btn btn-sm btn-warning" onclick="checkBitBrowserLogin(${a.id})">检测</button>
+                  <button class="btn btn-sm btn-ghost" onclick="checkAccount(${a.id})">查积分</button>
+                  <details class="advanced-actions">
+                    <summary class="btn btn-sm btn-ghost">高级</summary>
+                    <div class="advanced-menu">
+                      <button class="btn btn-sm btn-ghost" onclick="showBindProfileModal(${a.id}, '${escapeHtml(a.bitbrowser_profile_id || '')}')">绑定 Profile</button>
+                      <button class="btn btn-sm btn-ghost" onclick="openBitBrowser(${a.id})">仅打开窗口</button>
+                      <button class="btn btn-sm btn-danger" onclick="deleteAccount(${a.id})">删除账号</button>
+                    </div>
+                  </details>
+                </div>
               </td>
             </tr>`;
           }).join("");
-        } catch (e) { console.error(e); }
+          } catch (e) { console.error(e); }
+          finally {
+            clearTimeout(timeout);
+            accountsLoadInFlight = null;
+            const refreshImmediately = accountsRefreshRequested;
+            accountsRefreshRequested = false;
+            if (hasLoggingIn || refreshImmediately) scheduleAccountsRefresh(refreshImmediately ? 0 : ACCOUNTS_REFRESH_MS);
+            else if (accountsRefreshTimer) { clearTimeout(accountsRefreshTimer); accountsRefreshTimer = null; }
+          }
+        })();
+        return accountsLoadInFlight;
       }
       function parseImportAccounts(raw) {
         raw = raw.trim();
@@ -784,10 +897,7 @@ user3@example.com,password3"></textarea></div>
           if (res.ok && data.success !== false) {
             toast((data.autoBound ? "已自动匹配并绑定 Profile；" : "") + (data.message || okMsg || "操作完成"));
             if (data.pending) {
-              setTimeout(loadAccounts, 1000);
-              setTimeout(loadAccounts, 5000);
-              setTimeout(loadAccounts, 15000);
-              setTimeout(loadAccounts, 45000);
+              scheduleAccountsRefresh(1000);
             }
           } else {
             toast((data.error || data.message || `操作失败 HTTP ${res.status}`), "error");

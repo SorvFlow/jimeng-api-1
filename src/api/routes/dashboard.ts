@@ -11,6 +11,39 @@ import BitBrowserClient, { checkDreaminaLoginByCdp, discoverRunningDreaminaConte
 
 const loginTasks = new Set<number>();
 
+/**
+ * Extract the Dreamina session token from a browser Cookie header.
+ *
+ * Depending on the account/region and the identity service response, the
+ * browser may expose any of `sessionid`, `sessionid_ss`, `sid_tt`, or only
+ * `sid_guard`.  The first three carry the token directly; `sid_guard` stores
+ * it as the first `|`-separated field (usually URI encoded as `%7C`).
+ */
+function extractDreaminaSessionToken(cookieHeader?: string | null): string | null {
+  const values = new Map<string, string>();
+  for (const part of String(cookieHeader || '').split(';')) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    const name = part.slice(0, separator).trim().toLowerCase();
+    const value = part.slice(separator + 1).trim();
+    if (name && value && !values.has(name)) values.set(name, value);
+  }
+
+  for (const name of ['sessionid', 'sessionid_ss', 'sid_tt']) {
+    const value = values.get(name);
+    if (value) return value;
+  }
+
+  const sidGuard = values.get('sid_guard');
+  if (sidGuard) {
+    let decoded = sidGuard;
+    try { decoded = decodeURIComponent(sidGuard); } catch { /* keep raw value */ }
+    const token = decoded.split('|')[0].trim();
+    if (token) return token;
+  }
+  return null;
+}
+
 // 验证登录状态的辅助函数
 function getSessionUserId(request: Request): number | null {
   const sessionId = request.headers.cookie?.match(/session=([^;]+)/)?.[1];
@@ -24,6 +57,18 @@ function requireAuth(request: Request): number {
     throw new Exception(EX.SYSTEM_UNAUTHORIZED).setHTTPStatusCode(HTTP_STATUS_CODES.UNAUTHORIZED);
   }
   return userId;
+}
+
+// Keep login progress compatible with databases created before the progress
+// columns/functions were introduced. The fallback still exposes the phase in
+// last_login_error while the normal path stores structured progress fields.
+function updateLoginProgress(accountId: number, message: string, progress?: any): void {
+  const update = (db as any).updateAccountLoginProgress;
+  if (typeof update === 'function') {
+    update(accountId, message, progress);
+  } else {
+    db.updateAccountLoginStatus(accountId, 'logging_in', message || '登录处理中');
+  }
 }
 
 
@@ -399,17 +444,45 @@ export default {
       }
 
       loginTasks.add(accountId);
-      db.updateAccountLoginStatus(accountId, 'logging_in');
+      db.updateAccountLoginStatus(accountId, 'logging_in', '登录任务已启动');
 
       // 不阻塞 HTTP 请求：浏览器登录可能等待页面加载/验证码/跳转，前端通过账号列表状态观察结果。
       (async () => {
         try {
           const client = new BitBrowserClient();
+          // Profile resolution can involve a paginated BitBrowser API call or
+          // profile creation. Persist this phase before awaiting it so the UI
+          // never appears stuck at the generic "登录中" state.
+          updateLoginProgress(accountId, '正在匹配 BitBrowser Profile', {
+            stage: 'resolving_profile',
+            percent: 8,
+            status: 'logging_in',
+          });
           const resolved = await resolveBitBrowserProfile(account, client);
+          updateLoginProgress(accountId, 'Profile 已匹配，正在打开浏览器', {
+            stage: 'opening_browser',
+            percent: 15,
+            status: 'logging_in',
+          });
           const result = await loginDreaminaViaBitBrowser({
             bitbrowserProfileId: resolved.profileId,
             username: account.login_username,
             password: db.decryptSecret(account.login_password || ''),
+            onOpened: (runtime) => {
+              // Persist the runtime as soon as BitBrowser opens. The user may
+              // need to finish a captcha/2FA manually while the detached task
+              // is still running, and check-login must be able to find the
+              // correct CDP endpoint during that window.
+              db.updateAccountBitBrowserRuntime(accountId, {
+                cdp_port: runtime.cdpPort || 0,
+                cdp_ws_url: runtime.cdpWsUrl || '',
+                bitbrowser_window_id: resolved.profileId,
+                user_agent: runtime.userAgent || '',
+              });
+            },
+            onProgress: (message) => {
+              updateLoginProgress(accountId, message || '登录处理中');
+            },
           });
           db.updateAccountBitBrowserRuntime(accountId, {
             cdp_port: result.cdpPort || 0,
@@ -418,15 +491,19 @@ export default {
             user_agent: result.userAgent || ''
           });
           if (result.cookies) {
-            const sessionMatch = result.cookies.match(/(?:^|;\s*)sessionid=([^;]+)/);
-            if (sessionMatch?.[1]) {
-              const token = `${account.region || 'vn'}-${sessionMatch[1]}`;
+            const sessionToken = extractDreaminaSessionToken(result.cookies);
+            if (sessionToken) {
+              const token = `${account.region || 'vn'}-${sessionToken}`;
               db.updateAccountTokenAndCookie(accountId, token, result.cookies);
             } else {
               db.updateAccountCookie(accountId, result.cookies);
             }
           }
-          db.updateAccountLoginStatus(accountId, result.status, result.status === 'failed' ? (result.message || '登录未确认') : '');
+          db.updateAccountLoginStatus(
+            accountId,
+            result.status,
+            result.message || (result.status === 'failed' ? '登录未确认' : ''),
+          );
         } catch (e) {
           db.updateAccountLoginStatus(accountId, 'failed', e.message);
         } finally {
@@ -443,43 +520,79 @@ export default {
       const { id } = request.body;
       const account = db.getAccountById(Number(id));
       if (!account) return new Response({ error: '账号不存在' }, { statusCode: 404 });
-      let cdpPort = Number(account.cdp_port || process.env.DREAMINA_CDP_PORT || 0);
+      let cdpPort = Number(account.cdp_port || 0);
       let cdpWsUrl = account.cdp_ws_url || undefined;
-      let runningContext: any = null;
+      const profileId = String(account.bitbrowser_profile_id || account.bitbrowser_window_id || '').trim();
       try {
-        runningContext = await discoverRunningDreaminaContext([account.cdp_port, process.env.DREAMINA_CDP_PORT]);
-        if (runningContext) {
-          cdpPort = runningContext.cdpPort;
-          cdpWsUrl = runningContext.pageWsUrl || cdpWsUrl;
-          if (runningContext.profileId || runningContext.cdpPort || runningContext.pageWsUrl) {
-            if (runningContext.profileId && !account.bitbrowser_profile_id) {
-              db.updateAccountBitBrowserProfile(Number(id), runningContext.profileId);
-            }
-            db.updateAccountBitBrowserRuntime(Number(id), {
-              cdp_port: runningContext.cdpPort,
-              cdp_ws_url: runningContext.pageWsUrl || '',
-              bitbrowser_window_id: runningContext.profileId || account.bitbrowser_profile_id || '',
-            });
+        if (!cdpPort) {
+          if (!profileId) {
+            const message = '账号没有已绑定的 BitBrowser 窗口或 CDP 端口，请先绑定 Profile 并打开该账号窗口，再手动登录后检测';
+            db.updateAccountLoginStatus(Number(id), 'failed', message);
+            return new Response({ error: message }, { statusCode: 400 });
           }
         }
-      } catch { /* ignore discovery failure and fallback to stored CDP */ }
-      if (!cdpPort) return new Response({ error: '缺少 CDP 端口，请先打开 BitBrowser' }, { statusCode: 400 });
-      try {
-        const result = await checkDreaminaLoginByCdp(cdpPort, cdpWsUrl);
+        updateLoginProgress(Number(id), '正在检测当前页面登录状态', {
+          stage: 'checking_session', percent: 85, status: 'logging_in'
+        });
+        let result;
+        let firstCheckError: any;
+        if (cdpPort) {
+          try {
+            result = await checkDreaminaLoginByCdp(cdpPort, cdpWsUrl);
+          } catch (error) {
+            firstCheckError = error;
+          }
+        }
+        // Opening a BitBrowser profile is a launch operation. Reuse its saved
+        // CDP endpoint for normal checks; only reopen this account's bound
+        // profile when that endpoint is no longer reachable.
+        if (!result && profileId) {
+          updateLoginProgress(Number(id), '正在重新连接已绑定 BitBrowser 窗口', {
+            stage: 'connecting_cdp', percent: 35, status: 'logging_in'
+          });
+          const opened = await new BitBrowserClient().open(profileId);
+          if (!opened.cdpPort) {
+            throw new Error(`已绑定 Profile 未返回有效 CDP 端口${firstCheckError ? `；旧端口检测失败：${firstCheckError.message}` : ''}`);
+          }
+          cdpPort = opened.cdpPort;
+          cdpWsUrl = opened.ws?.includes('/devtools/page/') ? opened.ws : undefined;
+          db.updateAccountBitBrowserRuntime(Number(id), {
+            cdp_port: cdpPort,
+            cdp_ws_url: cdpWsUrl || '',
+            bitbrowser_window_id: profileId,
+            user_agent: account.user_agent || '',
+          });
+          result = await checkDreaminaLoginByCdp(cdpPort, cdpWsUrl);
+        }
+        if (!result) {
+          throw firstCheckError || new Error('账号 CDP 检测失败');
+        }
+        db.updateAccountBitBrowserRuntime(Number(id), {
+          cdp_port: result.cdpPort || cdpPort,
+          cdp_ws_url: result.cdpWsUrl || cdpWsUrl || '',
+          bitbrowser_window_id: profileId,
+          user_agent: result.userAgent || account.user_agent || '',
+        });
         if (result.cookies) {
-          const sessionMatch = result.cookies.match(/(?:^|;\s*)sessionid=([^;]+)/);
-          if (sessionMatch?.[1]) {
-            const token = `${account.region || 'vn'}-${sessionMatch[1]}`;
+          const sessionToken = extractDreaminaSessionToken(result.cookies);
+          if (sessionToken) {
+            const token = `${account.region || 'vn'}-${sessionToken}`;
             db.updateAccountTokenAndCookie(Number(id), token, result.cookies);
-          } else {
-            db.updateAccountCookie(Number(id), result.cookies);
           }
         }
-        db.updateAccountLoginStatus(Number(id), result.status, result.status === 'failed' ? '未检测到登录态 Cookie' : '');
-        return { success: result.status === 'ok', runningContext, ...result };
+        const message = result.message || (result.status === 'failed'
+          ? '绑定窗口尚未检测到有效登录态，请在该账号的 Dreamina 页面完成登录，再点击“检测”'
+          : '');
+        db.updateAccountLoginStatus(
+          Number(id),
+          result.status,
+          message,
+        );
+        return { success: result.status === 'ok', ...result, message };
       } catch (e) {
-        db.updateAccountLoginStatus(Number(id), 'failed', e.message);
-        return new Response({ error: '检测失败: ' + e.message }, { statusCode: 500 });
+        const message = '检测绑定账号窗口失败: ' + e.message + '；请确认该账号的 BitBrowser 窗口及 CDP 端口可从 API 服务器访问';
+        db.updateAccountLoginStatus(Number(id), 'failed', message);
+        return new Response({ error: message }, { statusCode: 500 });
       }
     },
 

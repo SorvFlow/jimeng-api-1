@@ -142,6 +142,22 @@ try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN user_agent TEXT DEFAULT ''
 try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_status TEXT DEFAULT 'unknown'"); } catch (e) { /* 字段已存在 */ }
 try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN last_login_at TEXT"); } catch (e) { /* 字段已存在 */ }
 try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN last_login_error TEXT DEFAULT ''"); } catch (e) { /* 字段已存在 */ }
+try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_progress_stage TEXT DEFAULT 'idle'"); } catch (e) { /* 字段已存在 */ }
+try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_progress_percent INTEGER DEFAULT 0"); } catch (e) { /* 字段已存在 */ }
+try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_progress_message TEXT DEFAULT ''"); } catch (e) { /* 字段已存在 */ }
+try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_progress_blocker TEXT DEFAULT ''"); } catch (e) { /* 字段已存在 */ }
+try { db.exec("ALTER TABLE jimeng_accounts ADD COLUMN login_progress_updated_at TEXT"); } catch (e) { /* 字段已存在 */ }
+
+// Browser login jobs run in this process and cannot survive a restart. Keep
+// saved sessions intact, but release their stale UI state so users can check
+// the still-open browser manually or start a fresh login task.
+const interruptedLoginMessage = '服务已重启，上次登录任务已中断；若已在浏览器完成登录，请点击“检测”，或重新登录';
+db.prepare(`UPDATE jimeng_accounts
+  SET login_status = 'failed', last_login_error = ?, login_progress_stage = 'failed',
+      login_progress_percent = 0, login_progress_message = ?, login_progress_blocker = ?,
+      login_progress_updated_at = datetime('now', 'localtime')
+  WHERE login_status = 'logging_in'`)
+  .run(interruptedLoginMessage, interruptedLoginMessage, interruptedLoginMessage);
 
 // 初始化默认积分消耗规则（仅在表为空时插入）
 const ruleCount = (db.prepare('SELECT COUNT(*) as c FROM cost_rules').get() as { c: number }).c;
@@ -457,6 +473,8 @@ export function getAccounts() {
     SELECT id, name, token_preview, region, proxy_url,
            bitbrowser_profile_id, bitbrowser_window_id, cdp_port, cdp_ws_url,
            login_username, login_status, last_login_at, last_login_error,
+           login_progress_stage, login_progress_percent, login_progress_message,
+           login_progress_blocker, login_progress_updated_at,
            CASE WHEN cookie IS NOT NULL AND cookie != '' THEN 1 ELSE 0 END as has_cookie,
            credits_remaining, credits_total, status, last_check, created_at
     FROM jimeng_accounts ORDER BY created_at DESC
@@ -535,8 +553,55 @@ export function updateAccountBitBrowserRuntime(id: number, runtime: { cdp_port?:
 }
 
 export function updateAccountLoginStatus(id: number, status: string, error: string = ''): void {
-  db.prepare(`UPDATE jimeng_accounts SET login_status = ?, last_login_error = ?, last_login_at = datetime('now', 'localtime') WHERE id = ?`)
-    .run(status, error, id);
+  const defaults: Record<string, { stage: string; percent: number; message: string; blocker: string }> = {
+    pending: { stage: 'idle', percent: 0, message: '等待开始', blocker: '' },
+    logging_in: { stage: 'starting', percent: 5, message: error || '登录处理中', blocker: '' },
+    ok: { stage: 'completed', percent: 100, message: '登录已确认', blocker: '' },
+    need_2fa: { stage: 'waiting_verification', percent: 70, message: error || '等待人工验证', blocker: error || '请在 BitBrowser 中完成验证码或二次验证' },
+    failed: { stage: 'failed', percent: 0, message: error || '登录失败', blocker: error || '请查看错误信息后重试' },
+    unknown: { stage: 'idle', percent: 0, message: error || '', blocker: '' },
+  };
+  const fallback = defaults[status] || defaults.unknown;
+  db.prepare(`UPDATE jimeng_accounts
+    SET login_status = ?, last_login_error = ?, last_login_at = datetime('now', 'localtime'),
+        login_progress_stage = ?, login_progress_percent = ?, login_progress_message = ?,
+        login_progress_blocker = ?, login_progress_updated_at = datetime('now', 'localtime')
+    WHERE id = ?`)
+    .run(status, error, fallback.stage, fallback.percent, fallback.message, fallback.blocker, id);
+}
+
+/** 更新登录任务的可视化阶段；不会清除上一次已保存的 Cookie/token。 */
+export function updateAccountLoginProgress(id: number, message: string, progress?: {
+  stage?: string; percent?: number; blocker?: string; status?: string;
+}): void {
+  const text = String(message || '').trim();
+  let stage = progress?.stage || 'processing';
+  let percent = Number.isFinite(progress?.percent) ? Math.max(0, Math.min(100, Number(progress?.percent))) : 20;
+  let blocker = progress?.blocker || '';
+  if (!progress?.stage) {
+    // Match the most specific browser phase first. A broad "打开/open"
+    // check would otherwise classify "正在打开 Dreamina" as opening
+    // BitBrowser, and a generic "页面/page" check would hide the CDP phase.
+    if (/连接\s*(?:到)?\s*CDP|connect(?:ing)?\s*(?:to\s*)?CDP/i.test(text)) {
+      stage = 'connecting_cdp'; percent = 20;
+    } else if (/打开\s*BitBrowser|open(?:ing)?\s*BitBrowser|bitbrowser/i.test(text)) {
+      stage = 'opening_browser'; percent = 10;
+    } else if (/打开\s*Dreamina|导航|navigate|页面|page|加载|load/i.test(text)) {
+      stage = 'navigating'; percent = 30;
+    } else if (/登录表单|邮箱|密码|填写|credential|form/i.test(text)) {
+      stage = 'filling_credentials'; percent = 45;
+    } else if (/验证码|验证|captcha|2fa|two-factor|人工/i.test(text)) {
+      stage = 'waiting_verification'; percent = 70; blocker = text;
+    } else if (/检测|cookie|session|状态|检查|保存登录状态|saving.*state/i.test(text)) {
+      stage = 'checking_session'; percent = 85;
+    }
+  }
+  if (!blocker && stage === 'waiting_verification') blocker = text || '等待人工验证';
+  db.prepare(`UPDATE jimeng_accounts
+    SET login_status = COALESCE(?, login_status), login_progress_stage = ?, login_progress_percent = ?,
+        login_progress_message = ?, login_progress_blocker = ?, login_progress_updated_at = datetime('now', 'localtime')
+    WHERE id = ?`)
+    .run(progress?.status || 'logging_in', stage, percent, text, blocker, id);
 }
 
 export function updateAccountTokenAndCookie(id: number, token: string, cookie: string): void {
@@ -729,6 +794,7 @@ export default {
   getAccountCookieByToken,
   updateAccountTokenAndCookie,
   updateAccountLoginStatus,
+  updateAccountLoginProgress,
   updateAccountBitBrowserRuntime,
   updateAccountBitBrowserProfile,
   updateAccountLoginSecret,
