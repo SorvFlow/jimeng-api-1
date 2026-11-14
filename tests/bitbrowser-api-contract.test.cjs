@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const loader = require('./helpers/load-ts.cjs');
 
-function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openError, profiles, extraEnv = {} } = {}) {
+function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openError, profiles, extraEnv = {}, createResponses = [] } = {}) {
   const calls = [];
   const stubs = {
     ws: class WebSocket {},
@@ -14,6 +14,10 @@ function clientFor({ apiBase = 'http://127.0.0.1:54345', openData = {}, openErro
           if (endpoint === '/browser/list') {
             const start = (body.page - 1) * body.pageSize;
             return { status: 200, data: { success: true, data: { list: (profiles || []).slice(start, start + body.pageSize) } } };
+          }
+          if (endpoint === '/browser/update' && createResponses.length) {
+            const response = createResponses.shift();
+            return response;
           }
           if (openError) return { status: 400, data: { success: false, msg: openError } };
           return { status: 200, data: { success: true, data: openData } };
@@ -90,6 +94,57 @@ test('远程 API 的 CDP 监听只绑定其明确 IPv4 地址，保留显式参�
 test('BitBrowser API 错误响应按 msg 失败，不伪装成空窗口', async () => {
   const api = clientFor({ openError: 'profile is already opening' });
   await assert.rejects(api.client.open('profile-4'), /profile is already opening/);
+});
+
+test('无代理 Profile 遇到 dynamicIpUrl 要求时省略代理字段重试', async () => {
+  const api = clientFor({ createResponses: [
+    { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
+    { status: 200, data: { success: true, data: { id: 'auto-created' } } },
+  ] });
+
+  const result = await api.client.createProfileForAccount({
+    login_username: 'manual@example.com',
+  });
+
+  assert.equal(result.id, 'auto-created');
+  const createCalls = api.calls.filter(call => call.endpoint === '/browser/update');
+  assert.equal(createCalls.length, 2);
+  assert.equal(createCalls[0].body.proxyMethod, 3);
+  assert.equal(createCalls[0].body.proxyType, 'noproxy');
+  assert.equal(Object.hasOwn(createCalls[1].body, 'proxyMethod'), false);
+  assert.equal(Object.hasOwn(createCalls[1].body, 'proxyType'), false);
+  assert.equal(Object.hasOwn(createCalls[1].body, 'dynamicIpUrl'), false);
+});
+
+test('显式代理遇到 dynamicIpUrl 不会被重试为无代理', async () => {
+  const api = clientFor({ createResponses: [
+    { status: 400, data: { success: false, msg: '请填写提取URL: dynamicIpUrl' } },
+  ] });
+
+  await assert.rejects(
+    api.client.createProfileForAccount({
+      login_username: 'proxy@example.com',
+      proxy_url: 'http://proxy-user:proxy-pass@127.0.0.1:8080',
+    }),
+    /dynamicIpUrl/,
+  );
+
+  const createCalls = api.calls.filter(call => call.endpoint === '/browser/update');
+  assert.equal(createCalls.length, 1);
+  assert.equal(createCalls[0].body.proxyMethod, 2);
+  assert.equal(createCalls[0].body.host, '127.0.0.1');
+});
+
+test('无代理 Profile 遇到其他 BitBrowser 错误不会触发第二次创建', async () => {
+  const api = clientFor({ createResponses: [
+    { status: 400, data: { success: false, msg: 'invalid profile name' } },
+  ] });
+
+  await assert.rejects(
+    api.client.createProfileForAccount({ login_username: 'invalid@example.com' }),
+    /invalid profile name/,
+  );
+  assert.equal(api.calls.filter(call => call.endpoint === '/browser/update').length, 1);
 });
 
 test('Profile 自动绑定只接受唯一精确匹配，不按相似名称猜账号', async () => {

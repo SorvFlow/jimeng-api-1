@@ -188,6 +188,20 @@ function buildCreateProfilePayload(account: { name?: string; login_username?: st
   };
 }
 
+function buildNoProxyCreatePayload(payload: any): any {
+  const {
+    proxyMethod,
+    proxyType,
+    host,
+    port,
+    proxyUserName,
+    proxyPassword,
+    dynamicIpUrl,
+    ...rest
+  } = payload || {};
+  return rest;
+}
+
 function extractProfileId(data: any): string {
   return String(data?.id || data?.browserId || data?.browser_id || data?.data?.id || data?.data?.browserId || data?.data?.browser_id || '').trim();
 }
@@ -319,7 +333,20 @@ export class BitBrowserClient {
   async createProfileForAccount(account: { name?: string; login_username?: string; username?: string; proxy_url?: string; region?: string }): Promise<any> {
     const payload = buildCreateProfilePayload(account);
     logger.info(`自动创建 BitBrowser profile: ${mask(payload.name)}`);
-    const data = await this.createOrUpdate(payload);
+    let data: any;
+    try {
+      data = await this.createOrUpdate(payload);
+    } catch (error: any) {
+      const hasProxy = payload.proxyMethod === 2;
+      const message = String(error?.message || error || '');
+      // Some BitBrowser builds interpret proxyMethod=3 as dynamic proxy and
+      // reject a no-proxy profile because dynamicIpUrl is missing. Retry only
+      // for accounts without a proxy, leaving explicitly configured proxies
+      // untouched and avoiding a second create request for unrelated errors.
+      if (hasProxy || !/dynamicIpUrl|提取URL/i.test(message)) throw error;
+      logger.warn('BitBrowser 无代理创建被识别为动态代理，重试时省略全部代理字段');
+      data = await this.createOrUpdate(buildNoProxyCreatePayload(payload));
+    }
     const profileId = extractProfileId(data);
     if (profileId) return { ...data, id: profileId, autoCreatedPayload: { name: payload.name, url: payload.url, proxyType: payload.proxyType, host: payload.host, port: payload.port } };
 
